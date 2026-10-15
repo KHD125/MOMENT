@@ -440,10 +440,13 @@ def level_drift(nse_close: pd.DataFrame, other_close: pd.DataFrame,
     ratio = a / b
     med = ratio.median()
     dev = (ratio / med - 1).abs()
+    # pandas 3 raises on an all-NaN column. A stock with no overlapping prices
+    # has no drift and is dropped below, so it gets no worst date.
+    has = dev.notna().any()
     out = pd.DataFrame({
         "median_ratio": med,
         "max_drift": dev.max(),
-        "worst_date": dev.idxmax(),
+        "worst_date": dev.loc[:, has[has].index].idxmax().reindex(dev.columns),
         "days": ratio.notna().sum(),
     })
     return out.dropna(subset=["max_drift"]).sort_values("max_drift", ascending=False)
