@@ -1,0 +1,226 @@
+"""Footer must state how old each data source is, in trading days.
+
+Market caps are served from a snapshot the daily sync commits. If that sync
+fails, production would otherwise serve yesterday's figures with nothing on
+screen saying so.
+"""
+from datetime import date, datetime, time
+
+
+from src.core import startup_metrics as metrics
+from src.ui.components import data_freshness
+
+
+def setup_function():
+    metrics.reset_for_tests()
+
+
+def _freshness(monkeypatch, today, **facts):
+    for k, v in facts.items():
+        metrics.note(k, v)
+    import src.core.market_time as mt
+
+    monkeypatch.setattr(mt, "ist_today", lambda: today)
+    # Prices are judged against the session due by now (09:00 IST the next
+    # day), so the time of day is part of the clock being pinned.
+    monkeypatch.setattr(mt, "ist_now", lambda: datetime.combine(today, time(12, 0), tzinfo=mt.INDIA_TZ))
+    return {i["label"]: i for i in data_freshness()}
+
+
+def test_same_day_data_is_not_stale(monkeypatch):
+    got = _freshness(monkeypatch, date(2026, 8, 18), price_as_of="2026-08-18")
+    assert got["Prices"]["stale"] is False
+    assert got["Prices"]["behind"] == 0
+
+
+def test_monday_showing_friday_is_current_not_stale(monkeypatch):
+    """The whole reason for counting trading days rather than calendar days."""
+    got = _freshness(monkeypatch, date(2026, 8, 17), mcap_as_of="2026-08-14")
+    assert got["Market caps"]["behind"] == 1
+    assert got["Market caps"]["stale"] is False
+
+
+def test_a_source_several_trading_days_behind_is_stale(monkeypatch):
+    got = _freshness(monkeypatch, date(2026, 8, 18), mcap_as_of="2026-08-11")
+    assert got["Market caps"]["stale"] is True
+    assert got["Market caps"]["behind"] >= 2
+
+
+def test_very_old_data_is_stale_even_beyond_the_horizon(monkeypatch):
+    got = _freshness(monkeypatch, date(2026, 8, 18), price_as_of="2026-01-05")
+    assert got["Prices"]["stale"] is True
+    assert got["Prices"]["behind"] is None
+
+
+def test_absent_source_is_simply_not_reported(monkeypatch):
+    assert _freshness(monkeypatch, date(2026, 8, 18)) == {}
+
+
+def test_unparseable_date_is_skipped_rather_than_raising(monkeypatch):
+    assert _freshness(monkeypatch, date(2026, 8, 18), price_as_of="not-a-date") == {}
+
+
+def test_every_source_is_reported_together(monkeypatch):
+    got = _freshness(
+        monkeypatch, date(2026, 8, 18),
+        price_as_of="2026-08-18", mcap_as_of="2026-08-17",
+    )
+    assert set(got) == {"Prices", "Market caps"}
+    assert all(i["stale"] is False for i in got.values())
+
+
+def test_prices_appear_in_the_footer_sources(monkeypatch):
+    from src.ui import components
+
+    monkeypatch.setattr(
+        components, "_FRESHNESS_SOURCES", components._FRESHNESS_SOURCES
+    )
+    keys = [entry[0] for entry in components._FRESHNESS_SOURCES]
+    assert "price_as_of" in keys
+    assert "mcap_as_of" in keys
+    assert "ath_as_of" in keys
+
+
+# ── Every source in use gets a chip, dated or not ───────────────────────────
+
+def _freshness_with(monkeypatch, facts, today=date(2026, 8, 18)):
+    """Pin the clock, like _freshness above does.
+
+    This helper did not, so staleness was judged against the real today while
+    the fixtures below name fixed dates. The suite therefore passed on the day
+    it was written and failed by the same margin every day after -- a test that
+    measures the calendar rather than the code.
+    """
+    from src.core import startup_metrics as metrics
+    import src.core.market_time as mt
+    from src.ui import components
+
+    monkeypatch.setattr(metrics, "snapshot", lambda: {"facts": facts})
+    monkeypatch.setattr(mt, "ist_today", lambda: today)
+    monkeypatch.setattr(mt, "ist_now", lambda: datetime.combine(today, time(12, 0), tzinfo=mt.INDIA_TZ))
+    return {i["label"]: i for i in components.data_freshness()}
+
+
+def test_market_caps_appear_even_when_the_snapshot_carries_no_date(monkeypatch):
+    """The committed snapshot predated AsOf stamping, so the chip vanished.
+
+    A source silently missing from the freshness bar is the failure the bar
+    exists to prevent -- the reader sees a clean row of dates and cannot tell
+    that a source is being used undated.
+    """
+    items = _freshness_with(monkeypatch, {
+        "price_as_of": "2026-08-18", "price_path": "cache_fresh",
+        "mcap_path": "repo_snapshot",          # loaded, but no AsOf column
+    })
+    assert "Market caps" in items
+    assert items["Market caps"]["as_of"] == "date unknown"
+    assert items["Market caps"]["stale"] is True
+
+
+def test_all_time_highs_are_reported_as_a_source(monkeypatch):
+    items = _freshness_with(monkeypatch, {
+        "ath_as_of": "2026-08-18", "ath_path": "repo_snapshot",
+    })
+    assert "All-time highs" in items
+    assert items["All-time highs"]["as_of"] == "18 Aug"
+    assert items["All-time highs"]["stale"] is False
+
+
+def test_a_missing_ath_snapshot_says_the_column_is_not_all_time(monkeypatch):
+    """The fallback is a two-year high; the ribbon must not imply otherwise."""
+    items = _freshness_with(monkeypatch, {"ath_path": "absent"})
+    assert "All-time highs" in items
+    assert "not all-time" in items["All-time highs"]["as_of"]
+    assert items["All-time highs"]["stale"] is True
+
+
+def test_a_source_that_was_never_loaded_is_not_invented(monkeypatch):
+    """No date and no loader report means the source is genuinely absent."""
+    items = _freshness_with(monkeypatch, {"price_as_of": "2026-08-18"})
+    assert "Market caps" not in items
+    assert "Delivery" not in items
+
+
+def test_every_remaining_source_reports_together(monkeypatch):
+    items = _freshness_with(monkeypatch, {
+        "price_as_of": "2026-08-18", "price_path": "cache_fresh",
+        "mcap_as_of": "2026-08-18", "mcap_path": "repo_snapshot",
+        "ath_as_of": "2026-08-18", "ath_path": "repo_snapshot",
+    })
+    assert set(items) == {"Prices", "Market caps", "All-time highs"}
+    assert all(not i["stale"] for i in items.values())
+
+
+# ── The date shown must be the date the table describes ──────────────────────
+#
+# The ranking stops at the newest session the vendor has finished, so the price
+# frame can visibly reach a later date than the table is labelled with. On
+# 2026-09-18 that was 17 Sep in the frame against 16 Sep on the table.
+#
+# Showing only the date makes that read as a fault -- or worse, as the table
+# silently describing 17 Sep. Both facts, with the coverage that decided
+# between them, is the difference between a deliberate wait and a bug.
+
+def test_the_priced_row_reports_how_much_of_the_universe_it_has(monkeypatch):
+    items = _freshness(
+        monkeypatch, date(2026, 9, 18),
+        price_as_of="2026-09-16", price_coverage="750/750", price_path="cache_fresh",
+    )
+    assert items["Prices"]["coverage"] == "750/750"
+
+
+def test_the_session_being_waited_on_is_named(monkeypatch):
+    """Not naming it is what makes the ribbon look a day stale for no reason."""
+    items = _freshness(
+        monkeypatch, date(2026, 9, 18),
+        price_as_of="2026-09-16", price_coverage="750/750", price_path="cache_fresh",
+        price_deferred_as_of="2026-09-17", price_deferred_coverage="378/750",
+    )
+    assert "Latest session" in items, (
+        "the frame reaches a newer session than the table and the ribbon says "
+        "nothing about it"
+    )
+    later = items["Latest session"]
+    assert later["as_of"] == "17 Sep"
+    assert later["coverage"] == "378/750"
+
+
+def test_waiting_for_a_session_is_not_rendered_as_a_fault(monkeypatch):
+    """An amber chip here would train the reader to ignore the real ones.
+
+    The vendor publishes an Indian session over roughly a day and a half.
+    Waiting for it is the correct behaviour, every single day.
+    """
+    from src.ui.components import age_phrase
+
+    items = _freshness(
+        monkeypatch, date(2026, 9, 18),
+        price_as_of="2026-09-16", price_coverage="750/750", price_path="cache_fresh",
+        price_deferred_as_of="2026-09-17", price_deferred_coverage="378/750",
+    )
+    later = items["Latest session"]
+    assert later["stale"] is False
+    assert age_phrase(later) == " · still publishing", (
+        "the deferred session is being described with a staleness phrase, "
+        "which misreads what it is"
+    )
+
+
+def test_nothing_extra_appears_when_the_newest_session_is_the_ranked_one(monkeypatch):
+    """In the steady state there is no second chip, and no explaining to do."""
+    items = _freshness(
+        monkeypatch, date(2026, 9, 18),
+        price_as_of="2026-09-17", price_coverage="750/750", price_path="cache_fresh",
+    )
+    assert "Latest session" not in items
+    assert items["Prices"]["coverage"] == "750/750"
+
+
+def test_a_missing_coverage_fact_degrades_quietly(monkeypatch):
+    """Older snapshots predate the coverage fact; the ribbon must still render."""
+    items = _freshness(
+        monkeypatch, date(2026, 9, 18),
+        price_as_of="2026-09-16", price_path="cache_fresh",
+    )
+    assert items["Prices"]["coverage"] is None
+    assert items["Prices"]["as_of"] == "16 Sep"

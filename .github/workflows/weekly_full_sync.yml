@@ -1,0 +1,152 @@
+name: Weekly Full Sync (Friday night)
+
+on:
+  schedule:
+    # Every Friday at 23:00 IST = 18:30 UTC (adjust if DST not needed)
+    - cron: '30 18 * * 5'
+  workflow_dispatch: # This job rebuilds the whole archive; it must be runnable
+                     # on demand. Without this there was no way to deepen the
+                     # history except to wait for Friday, and no way to test a
+                     # change to the full-refresh path at all.
+
+# The SAME group as daily_sync.yml, deliberately. These are two workflows but
+# one resource: both write the price-data-* cache namespace and both commit to
+# main. Overlapping them races the rebase-and-retry push, and worse, a full
+# refresh finishing mid-incremental would have its rebuilt archive overwritten
+# by the shorter frame the other job is holding in memory.
+concurrency:
+  group: daily-sync
+  cancel-in-progress: false
+
+jobs:
+  full-sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version-file: .python-version
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      # The SAME key namespace the daily sync reads and writes. This job used
+      # to restore and save under `price-cache-*` while the daily job used
+      # `price-data-*`, so the two never saw each other's work: the full
+      # re-download landed in a cache nothing else read, and the daily job went
+      # on topping up its own never-restated copy.
+      #
+      # And the key must CHANGE every run -- actions/cache treats an entry as
+      # immutable and skips the save outright when the key already exists. Keyed
+      # on hashFiles('src/**/*.py'), this one only changed when the source did,
+      # so most weeks it discarded the very thing it had just rebuilt.
+      - name: Restore price cache
+        id: restore-price-cache
+        uses: actions/cache/restore@v6
+        with:
+          path: ${{ github.workspace }}/data_cache/
+          key: price-data-${{ runner.os }}-${{ github.run_id }}
+          restore-keys: |
+            price-data-${{ runner.os }}-
+            price-data-
+
+      - name: Run full refresh sync
+        env:
+          FORCE_FULL: "true"
+          PYTHONPATH: .
+        run: |
+          python scripts/sync_data.py
+
+      - name: Save updated cache
+        if: always()
+        uses: actions/cache/save@v6
+        with:
+          path: ${{ github.workspace }}/data_cache/
+          key: price-data-${{ runner.os }}-${{ github.run_id }}
+
+      # The precomputed ranking only. No Yahoo price file is produced any more
+      # (owner, 2026-10-02), so nothing else is published; the restored cache
+      # may still hold an old Yahoo snapshot and it must not be re-uploaded.
+      - name: Publish ranking
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release view data-latest --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 || \
+            gh release create data-latest \
+              --repo "$GITHUB_REPOSITORY" \
+              --title "Latest data snapshots" \
+              --notes "Rolling data published by the sync jobs." \
+              --latest=false
+          RANK="${{ github.workspace }}/data_cache/rankings.parquet"
+          if [ -f "$RANK" ]; then
+            ls -lh "$RANK"
+            gh release upload data-latest "$RANK" \
+              --repo "$GITHUB_REPOSITORY" --clobber
+            echo "Uploaded rankings.parquet to release data-latest."
+          else
+            echo "::warning::No precomputed ranking was produced; the app will compute it."
+          fi
+
+      # A full re-download is exactly when a restatement lands, so re-scan.
+      # An event the vendor has now adjusted away stops being detected, and
+      # corporate_actions.adjust_prices re-verifies against the prices anyway.
+      - name: Check for corporate actions
+        run: python scripts/check_corporate_actions.py || echo "::warning::Corporate-actions check failed -- read the step log."
+
+      # WITHOUT THIS THE RUN LEARNS AND FORGETS.
+      #
+      # A full refresh re-downloads the entire archive, which re-introduces the
+      # zero-volume non-sessions Yahoo still serves for dates long past. The
+      # detector finds them and record_closed writes them into
+      # data/nse_trading_days.json -- in the runner's working copy, which was
+      # then discarded when the job ended.
+      #
+      # That is why only 2026-06-26 was ever learned automatically: it falls
+      # inside the daily job's 90-day heal window, so the DAILY re-introduced
+      # and committed it. 2026-01-15, 2026-05-01 and 2026-05-28 are older than
+      # any heal window, so only this job ever sees them, and only this job can
+      # record them.
+      #
+      # The corporate-action log survived the same gap by accident -- a later
+      # daily run re-scanned the deepened archive from cache and committed what
+      # it found. The calendar has no such second chance.
+      - name: Commit what this run learned
+        if: always()
+        run: |
+          git config --global user.name 'github-actions[bot]'
+          git config --global user.email 'github-actions[bot]@users.noreply.github.com'
+          git add -A data/
+          if git diff --staged --quiet; then
+            echo "Nothing new learned."
+            exit 0
+          fi
+          git diff --staged --stat
+          git commit -m "chore(data): weekly full sync findings [skip ci]"
+          for attempt in 1 2 3 4 5; do
+            if git push; then
+              echo "Pushed on attempt $attempt."
+              exit 0
+            fi
+            echo "Push rejected on attempt $attempt; rebasing onto origin/main."
+            git fetch origin main
+            git rebase origin/main || {
+              # In a REBASE the sides are swapped: --ours is origin/main and
+              # --theirs is the commit being replayed, i.e. this run's data.
+              # --ours here silently dropped the whole sync commit, and the
+              # next push then "succeeded" with nothing in it.
+              git checkout --theirs -- data/ 2>/dev/null || true
+              git add -A data/
+              GIT_EDITOR=true git rebase --continue || git rebase --abort
+            }
+            sleep $((attempt * 3))
+          done
+          echo "::error::Could not push the weekly findings after 5 attempts."
+          exit 1

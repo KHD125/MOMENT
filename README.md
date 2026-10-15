@@ -1,0 +1,400 @@
+# NSE Quantitative Momentum Terminal
+
+Institutional-style quantitative momentum ranking, portfolio construction and
+walk-forward backtesting for Indian equities (NSE), with an append-only monthly
+track record against Nifty 500.
+
+## V1 quantitative status
+
+The current V1 research model has been hardened against the main mathematical and architectural issues identified in the 2026 quantitative audit. The canonical System-1 signal is now calendar-period based and does **not** use R-squared.
+
+### System-1 — Sharpe Momentum
+
+Five calendar horizons:
+
+- 1 month
+- 3 months
+- 6 months
+- 9 months
+- 12 months
+
+For each as-of date, the engine:
+
+1. subtracts the calendar horizon from the as-of date;
+2. selects the first available market observation on or after that target date;
+3. uses the actual valid daily observations through the as-of date;
+4. calculates the approved period risk-adjusted momentum statistic;
+5. standardizes the cross-section using the approved outlier-control sequence; and
+6. combines the five standardized signals using the configured 10/30/30/20/10 weights.
+
+The approved System-1 Sharpe methodology is intentionally retained. It is a **period risk-adjusted momentum statistic**, not conventional annualized Sharpe, and should not be compared numerically with institutional annualized Sharpe figures.
+
+**R-squared is not part of System-1 and is not used to scale its score.**
+
+### Removed ranking systems
+
+System-1 is the **only** ranking system. Four alternatives — Vectorized
+Exp-Regression, Residual / Idiosyncratic Alpha, Industry-Relative Momentum and
+Momentum Acceleration — together with the Multi-Strategy Overlay tab, have been
+removed.
+
+None of them ever fed the composite Rank. Each produced extra columns and
+carried its own failure modes: residual alpha reached out to Yahoo mid-
+calculation, making a compute method's cost depend on a third party. Mean-
+Variance Optimization was removed from the portfolio engine for the same class
+of reason — it silently degraded to Equal Weight on any exception while still
+reporting itself as MVO (audit F1). Delivery Accumulation was removed with them.
+
+`tests/test_removed_systems_stay_removed.py` asserts their absence, so a
+re-import or a stray column reference cannot quietly resurrect a half-wired
+feature.
+
+### Three systems
+
+Nifty 750 (default), Nano Cap (every stock ≥ ₹2,000 Cr outside the 750) and
+Combined, chosen in Configuration; every page follows. Definitions,
+membership, records and the month-end calendar: `docs/THREE_SYSTEMS.md`.
+
+## Canonical V1 conventions
+
+### Benchmark
+
+The common V1 market benchmark is:
+
+`^CRSLDX` — Nifty 500.
+
+The ticker is kept as the key callers pass; the closes come from
+`data/benchmarks.csv` (`src/loaders/benchmark_store.py`), daily from
+8 Oct 2015: NSE's own daily file first, then SS's index chart, then Screener's.
+No Yahoo download is involved.
+
+Where a market benchmark is required by a V1 quantitative module, this benchmark should be used consistently unless a module has an explicitly documented reason not to.
+
+### Periods
+
+System-1 uses **calendar months**, not fixed trading-row windows. The legacy 21/63/126/189/252 momentum-window definition has been removed from the root configuration.
+
+Session-based windows may still exist in portfolio/risk components where they are intentionally part of the approved methodology. They must not be reused as System-1 economic horizons.
+
+**No window skips the most recent month.** Every horizon runs from its calendar
+start to the latest available observation. Verified against the live price file
+on 2026-09-11: the 1M/3M/6M/9M/12M windows all end on the same most recent
+trading date, and `src/engine/calendar_momentum.py` takes the closing price at
+that row (`p1 = prices_arr[end]`) with no offset, lag or exclusion.
+
+This is a deliberate departure from the classical Jegadeesh–Titman convention,
+which skips the most recent month to avoid short-term reversal. Two earlier
+captions in the UI *claimed* a skip-month was applied when the engine never did
+one; the text was corrected to match the code, not the other way round. The
+consequence of the choice stands: the ranking carries more one-month reversal
+exposure than the academic convention, and the most recent month is also
+counted by the 1M window in its own right.
+
+### Point-in-time universe
+
+Every rebalance is scored against the index as it **actually stood** on the
+signal date, wherever `data/membership_history.json` reaches back that far.
+Where it does not, the run falls back to the current constituent list and the
+Backtest tab **says so**, counting the periods either way. Index additions skew
+toward recent strong performers and this screen preferentially buys exactly
+those, so a month scored on today's list flatters the strategy by an amount
+that cannot be measured from the shipped data. The coverage figure is therefore
+reported rather than estimated.
+
+The history accumulates from the daily sync's committed NSE index snapshots. As of the 2026-09-30 membership-history rollout, `data/membership_history.json` records point-in-time history for NIFTY TOTAL MARKET, NIFTY 50, NIFTY NEXT 50, MIDCAP 150, SMALLCAP 250 and MICROCAP 250, with `DUMMY*` placeholders excluded. The legacy top-level Total Market shape is retained for compatibility while the canonical multi-index data lives under `indices`. PR #258 (`73b095a49b52ab1a4a968e21e364610e94ed02a5`) merged this implementation into `main`; post-merge R2 historical-evidence bootstrap run `36646326268` completed successfully, including publication of membership histories and the downstream historical datasets.
+
+### Concentration caps
+
+`stock_cap` and `sector_cap` bind in the **backtest** as well as the Portfolio
+tab, through one shared projection (`src.engine.portfolio.apply_caps`). A cap
+pair that no book of that shape can satisfy — twenty names across two
+industries cannot hold a 30% sector cap — is relaxed to the tightest feasible
+pair, logged, and reported on screen as relaxed. It is never silently applied.
+
+Two share lines of one company count as one (owner, 2026-10-02): Tata Motors'
+DVR (TATAMTRDVR, an index member until 2024-08-29) and its ordinary shares
+(TATAMOTORS, now TMPV) take one slot in a book (`backtester.SAME_COMPANY`), so
+the per-stock cap holds for the company.
+
+### Monthly backtest convention
+
+For monthly V1 rebalancing:
+
+- last available trading day of the month = signal/rebalance date at T close;
+- first available trading day of the following month = execution at T+1.
+
+The backtester uses the same canonical System-1 calendar-period engine as the
+live screener — literally the same functions, `period_sharpe_at` and
+`winsorised_z` in `src/engine/calendar_momentum.py`, not a second
+implementation that agrees on a fixture. Two implementations had drifted: only
+one carried the stale-anchor rule, and only one winsorised before z-scoring.
+
+### Reported backtest window
+
+The backtest reports the last **six completed calendar months**. The month in
+progress is excluded: a part-month return shown beside whole ones invites
+comparing three weeks against six full months, and it moves every session until
+the month closes. Rebalances are filtered on the **execution** date (T+1), so
+the rebalance signalled on the last session of the previous month — which fills
+on the first session of the current one — falls outside the reported window by
+construction.
+
+### Current book and this month's changes
+
+That exclusion leaves the person holding the portfolio with no answer to their
+two questions, so the Backtest tab answers them separately, above the
+performance tables:
+
+- **Current Holdings** — the book as it stands *after* this month's fill,
+  marked at the latest close, with entry date, entry price, unrealised return,
+  holding period, weight, and rank drift since entry. Names bought at this
+  month's fill carry that fill date and price; retained names keep their
+  original entry date, because buffer retention is not a re-entry.
+- **This Month's Changes** — SOLD / BOUGHT / HELD with the reason for each. A
+  SOLD row reports the realised round trip struck at the fill; BOUGHT and HELD
+  rows are unrealised at the latest close.
+
+These marks use the latest close — a date the reported window does not cover —
+and feed neither the equity curve, the monthly table, nor the headline stats.
+
+### Missing stock observations
+
+Exchange-wide closures may be removed as holidays. A stock-specific missing observation must **not** be forward-filled for quantitative return/volatility calculations. This prevents synthetic zero returns and artificial smoothing.
+
+### Cross-sectional normalization
+
+The documented pipeline is:
+
+`raw factor -> approved winsorization/outlier control -> Z-score -> final numerical clipping`
+
+The implementation must not describe simple Z-score clipping as raw-score winsorization.
+
+## Portfolio and risk methodology
+
+Portfolio/risk mathematics is intentionally separate from System-1 signal mathematics. Approved session-based risk calculations are not converted to calendar horizons merely because System-1 uses calendar periods.
+
+Examples include realized-volatility targeting, inverse-volatility weighting, covariance estimation and constrained ERC. These retain their approved session counts and annualization conventions.
+
+## Track Record, Portfolio and Actions
+
+The Track Record's pinned replay is the canonical current-book source for
+Portfolio and Actions. Portfolio adds capital sizing, shares, valuation and
+accounting presentation; it must not independently select or weight holdings.
+Actions reconciles its starting holdings against the same canonical book.
+Backtest remains independently configurable for historical research and is
+not the live Portfolio's source of truth.
+
+`data/track_record.json` is an **append-only** monthly record of the strategy's
+net account-level performance, from January 2026, against Nifty 500. Portfolio's
+equity curve and since-inception return use the same frozen monthly ledger plus
+the same live month-to-date result from the pinned replay. The current holdings
+table's unrealised P&L is a separate measure: it excludes realised P&L on sold
+positions and must not be confused with cumulative account performance.
+
+See [`docs/track_record_portfolio_architecture.md`](docs/track_record_portfolio_architecture.md)
+for the source-of-truth rules, accounting definitions and row-level acceptance
+gates.
+
+The backtest recomputes from live prices on every run, which is correct for a
+backtest and useless as a record: a vendor price revision, an index change or a
+nudged slider silently rewrites what January returned. So a closed month is
+written **once** and frozen — re-running the updater cannot move a stored
+number. Each entry carries the configuration fingerprint that produced it, the
+date it was frozen and the price date it was struck from.
+
+Months are marked by origin. **Recorded** months were frozen as they closed,
+from the data as it stood then. **Backfilled** months were reconstructed later
+from today's universe and prices, so they carry the backtest's biases and are
+weaker evidence. Month-to-date is never stored — it moves every session, so it
+is computed live and shown beside the frozen months.
+
+See [`docs/TRACK_RECORD.md`](docs/TRACK_RECORD.md) for the full contract,
+conventions and operations.
+
+## UI architecture and the rewrite question
+
+`docs/UI_ARCHITECTURE.md` records the measured cost of `st.tabs` rendering all
+eleven tab bodies on every run, and the recommendation that followed: migrate
+the shell to `st.navigation`/`st.Page` and rewrite the views in stages, while
+leaving `src/engine`, `src/loaders` and `src/core` alone. The engine's verified
+properties — screener/backtester parity, causality under future-scrambling, the
+corrected statistics — are the asset a blank rewrite would have to re-earn.
+
+## Research audit tracker
+
+See [`docs/V1_AUDIT_TRACKER.md`](docs/V1_AUDIT_TRACKER.md) for the full audit roadmap, completed corrections, and remaining research tasks.
+
+See [`docs/ADVERSARIAL_AUDIT_2026-09-10.md`](docs/ADVERSARIAL_AUDIT_2026-09-10.md)
+for the multi-agent adversarial audit: confirmed defects with reproductions,
+allegations investigated and rejected, and the remaining risks the corrections
+do **not** address — chiefly that 7 of the 8 recorded months are backfilled
+reconstructions, and that every figure in this application is **pre-tax**.
+
+What is still open, in one list: [`docs/TODO.md`](docs/TODO.md).
+
+See [`docs/PARKED_IDEAS.md`](docs/PARKED_IDEAS.md) for features and integrations that were researched and deliberately set aside, with recorded reasoning.
+
+## Core capabilities
+
+Tabs, in the order the app renders them:
+
+1. **Screener**: Full-universe screening with multi-prefix search — `[INDEX]`, `[INDUSTRY]`, `[SECTOR]`, and `[TV_INDUSTRY]` prefixes narrow the view without typing ticker names. Ranking, rank movers, single-stock deep-dive (opens in a full-screen modal dialog), and CSV export.
+2. **Qualified**: High-conviction screening and concentration analysis.
+3. **Sectors**: Industry rankings.
+4. **RRG**: Relative Rotation Graph analysis.
+5. **Portfolio**: Canonical Track Record model book with capital sizing, current marks, holdings P&L, account equity/performance history and rebalance activity. It does not run an independent stock-selection engine.
+6. **Watchlist**: Custom portfolio tracking against quantitative rankings.
+7. **Market Breadth**: Moving-average breadth and high/low statistics.
+8. **Backtest**: Walk-forward backtesting over the last six completed months, rank at T close and execution at T+1, plus the current book and this month's changes. The entire tab runs as an independent Streamlit fragment — its controls rerun only the backtest, not the screener or any other tab.
+9. **Track Record**: The frozen monthly record against Nifty 500 — see below.
+10. **Configuration**: Index constituents, factor weights, risk parameters and cache diagnostics. Organised as a Windows 11-style left-nav with four sections: *Data & Sync*, *Momentum Signal*, *Portfolio Risk*, and *Data Health*. Each section is rendered on demand; only the active section appears on screen.
+11. **Guide**: In-app methodology reference.
+
+## UI patterns
+
+The app uses four modern Streamlit primitives that reduce full-page reruns and noise:
+
+| Pattern | Where used | Why |
+|---|---|---|
+| `st.dialog()` | Screener stock drilldown | Opens as a full-screen modal so the underlying screener ranking stays visible without a page scroll jump |
+| `st.fragment()` | Entire Backtest tab | Backtest controls rerun only the backtest body; Config weight changes still trigger a full rerun via the top-level read in `app.py` |
+| `st.popover()` | Screener column guide, Config window guide | Floating reference panel without leaving the current screen |
+| `st.status()` | App startup, Config constituent sync | Structured progress with running/complete/error states and collapsible step log |
+
+**Navigation is `st.navigation`/`st.Page`, not `st.tabs`.** Only the active
+page's script executes. `st.tabs` ran all eleven bodies on every interaction —
+Streamlit's documented behaviour, not a bug — which cost ~1.0 s of Python per
+click and put every tab's widgets in one DOM at once. Measured after the
+migration: **0.43 s per rerun** (−56%), with 2 buttons and 2 selectboxes in the
+DOM instead of 18 and 13. See `docs/UI_ARCHITECTURE.md`.
+
+The consequence to respect when adding a widget: **leaving a page evicts every
+widget on it.** Give every keyed widget an explicit value, and a mirror key if
+the choice should survive the reader navigating away — see *Configuration
+settings and widget state* above. Under `st.tabs` nothing was ever evicted, so
+this rule did not used to bite outside the Configuration page.
+
+Table rendering deliberately splits into two tiers:
+- **Main screener** and **all secondary tables** (live book, monthly returns, closed trades, sector breakdown, track record): custom HTML via `render_saas_table` in `src/ui/theme.py`, which supports per-cell conditional coloring that `st.column_config` cannot replicate.
+- **Backtest parameter sweep**: `st.dataframe` with `column_config` for progress bars on numeric columns; no per-cell coloring needed there.
+
+## Configuration settings and widget state
+
+Every `cfg_*` setting is read through `src/ui/widget_state.py`, never directly
+from `st.session_state`. Two faults made this necessary, both confirmed against
+the live deployment and neither reproducible in `AppTest`, which exercises the
+Python side only and never runs the frontend:
+
+1. **Eviction.** Streamlit discards widget state for any key whose widget was
+   not rendered on the previous run. The Configuration tab renders one section
+   per run from its left-nav, so opening *Portfolio Risk* evicted every
+   `cfg_w*` key — and the absence guard then restored the documented defaults
+   over the reader's own settings, silently, while the panel still described
+   their configuration. Worse for the risk caps, where an evicted value returns
+   *plausible*: a 30% sector cap as 15%, a 5% stock cap as 2%, both of which
+   bind the book and the backtest.
+
+2. **No explicit value.** A slider declared with `key=` and no `value=` renders
+   at its **minimum** on the deployed frontend regardless of what session state
+   holds. Measured on 2026-09-11: fourteen sliders in one live DOM, and the
+   only five rendering wrong were the only five passing no explicit value — the
+   Backtest tab's five lookback sliders, identical in range and step but given
+   `float(weights[i])`, were correct in the same frame.
+
+The two rules that follow, enforced by
+`tests/test_config_sliders_carry_explicit_values.py`:
+
+- **Every engine-bound widget is given an explicit `value=`.** Never rely on
+  session state to reach the widget by itself.
+- **Every setting keeps a mirror key** (`<key>__v`) that no widget owns and
+  eviction cannot touch. `resolve()` reads live widget → mirror → documented
+  default, rejecting present-but-impossible values; `remember()` records the
+  rendered value.
+
+Never write `st.session_state[<widget key>]` after that widget has been
+created in the same run — it raises `StreamlitWidgetAlreadyInstantiatedError`
+and takes the whole tab down. Write the mirror instead.
+
+## Dependency pinning
+
+`streamlit` is pinned to an exact version in `requirements.txt`, not floated.
+Streamlit Cloud reinstalls on every reboot, so a `>=` specifier lets it install
+a different **frontend** with no commit in this repository — and the frontend
+is where the Configuration sliders rendered at their minimum. To upgrade: bump
+the pin, let **V1 Production QA** verify against the live app, then keep it.
+`tests/test_no_diagnostics_in_the_ui.py` fails if the pin is loosened.
+
+The rest of the runtime stack is pinned for the same reason: pandas, numpy,
+pyarrow, requests (`tests/test_dependency_pins.py`).
+boto3 is the one documented range. Dependabot opens a PR for each new
+release. pyarrow 25.0.1 segfaults (apache/arrow#50471), so do not take it.
+
+## Production data and runtime architecture
+
+The production application uses a strict separation between the canonical ranking path and auxiliary deep-history data:
+
+- **Canonical V1 ranking source:** Screener data published to Cloudflare R2 at `prices/screener`. The ranking artifact is consumed through the canonical ranking-store contract; Yahoo downloads must not replace this path.
+- **Second source:** NSE's own daily closes (committed `data/nse_prices`, split/bonus/demerger adjusted) fill what Screener lacks. Order: Screener, then NSE (`src/loaders/price_source.ranking_frames`, the one function the app and the nightly precompute both call).
+- **SS and the three-source check (2026-10-02).** SS (daily OHLCV, 1,216 stocks) is collected each weeknight at 22:02 IST, gently, by `ss_sync.yml`, saved to the release and to R2 (`prices/ss`), then checked against Screener and NSE: rights factors from NSE's terms, a two-of-three vote on every day's move with NSE's own record as judge, renames from NSE's symbol-change list and ISINs. The report is the run's summary; no stored price is changed. SS is not yet the app's source. See `docs/PRICE_PIPELINE.md`.
+- **NSE history from 2010** on R2 (`nse/prices_daily`, `nse/corporate_actions_history`) for long backtests: NSE's full bhavcopy imported from a public mirror checked equal to NSE's own file, corporate actions from NSE's yearly list.
+- **No Yahoo (owner, 2026-10-02).** Prices, deep history (Screener's ~10-year store), the track record, market caps (NSE, then the committed snapshot), all-time highs (Screener closes) and the Nifty 500 / Nifty 50 benchmark (`data/benchmarks.csv`, from NSE's daily bundle with Screener for older history) are all Yahoo-free. Existing Yahoo objects on R2 (`prices/yahoo*`, `app/prices_*`) are no longer published or read.
+- **Universe:** the current NIFTY TOTAL MARKET production universe is the reconciled set of **750 tradable symbols**. NSE `DUMMY*` placeholders are discarded; aliases must not be invented to repair missing symbols.
+- **Ranking completeness:** the canonical ranking pipeline requires **100% current-universe coverage**. This prevents a valid-looking 749/750 ranking from being published.
+  The one exception is owner decision 2B. Up to 5 stragglers that printed within the last 5 sessions are ranked on their last print, flagged ⏸, and count toward that 100%. Any other gap makes the session ineligible, and the ranking falls back to the previous complete one.
+- **Published artifact:** when a validated precomputed ranking is available, Streamlit accepts the canonical artifact and **skips the runtime ranking engine**. This is an intentional performance path, not a degraded mode.
+- **Streamlit reruns:** contract validation and Screener-frame shaping are memoized using the complete logical contract and immutable R2 revision identity respectively. Repeated reruns therefore avoid repeating equivalent work while still invalidating when the underlying ranking contract or R2 revision changes.
+
+The 2026-09-23 production deployment verified the full path: 750-row ranking accepted from the R2 Screener store, Yahoo deep history loaded from its separate R2 archive (since retired, 2026-10-02), and the runtime engine skipped after canonical precomputed acceptance.
+
+## Verified production data state
+
+As of 2026-09-30, the membership-history implementation is merged to `main` and its post-merge R2 publication is green. The verified production pipeline includes index constituent snapshots, point-in-time membership histories, the combined universe, historical sector/industry classification, confirmed trading sessions, historical market caps, and corporate-action evidence. The canonical ranking publication is also green (R2 ranking calculation archive run `36646326289`). This is the verified state; do not describe membership history as merely a recent/current-list fallback where the recorded history covers the signal date.
+
+## Data integrity
+
+- Exchange-wide closure rows are filtered using the existing holiday-detection rule.
+- Security-specific missing observations remain missing for quantitative calculations.
+- Short-history securities are masked where the required statistical sample is unavailable.
+- Data-gap diagnostics remain available to identify problematic securities.
+- Corporate actions are adjusted automatically by the rules in `docs/PRICE_PIPELINE.md`: splits and bonuses only where the price moved by the factor, rights from NSE's terms only where a source left them raw, renames from NSE's symbol-change list and ISINs joined only where the series meet.
+- NSE ships **DUMMY placeholder rows** in its constituent files for corporate actions in flight (four in NIFTY TOTAL MARKET as of Sep 2026, e.g. `DUMMYTRVN`). Any symbol beginning `DUMMY`, shorter than two characters, or literally `NAN` is discarded by the loader, so the real universe is smaller than the raw row count. These placeholders have no price history; ranking one could put an untradeable ticker in the portfolio.
+
+## Project structure
+
+```text
+├── .github/workflows/   # daily data sync, monthly track-record freeze, QA probes
+├── .streamlit/
+├── data/
+│   ├── indices/             # NSE constituent snapshots (committed by the daily sync)
+│   └── track_record.json    # append-only monthly record
+├── docs/
+├── scripts/             # sync_data, update_track_record, QA probes
+├── src/
+│   ├── core/
+│   ├── loaders/
+│   ├── engine/          # momentum, backtester, portfolio, track_record
+│   └── ui/
+│       ├── views/
+│       └── widget_state.py  # resolve/remember for every cfg_* setting
+├── tests/
+├── app.py
+├── requirements.txt
+└── README.md
+```
+
+## Running locally
+
+```bash
+pip install -r requirements.txt   # runtime deps are pinned exactly; see above
+streamlit run app.py
+```
+
+Tests:
+
+```bash
+python -m pytest -q     # 789 tests
+```
+
+## Disclaimer
+
+Educational and research use only. Not financial or investment advice.

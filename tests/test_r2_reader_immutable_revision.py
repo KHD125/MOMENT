@@ -1,0 +1,131 @@
+import pytest
+
+from src.storage.reader import R2DatasetReader
+
+
+class FakeArchive:
+    def __init__(self):
+        self.manifests = {}
+        self.objects = {}
+
+    def list_keys(self, prefix):
+        return [k for k in self.manifests if k.startswith(prefix)]
+
+    def get_bytes(self, key):
+        return self.manifests[key]
+
+    def head(self, key):
+        return {"ContentLength": len(self.objects[key])}
+
+
+def _manifest(dataset, as_of, revision, created_at, object_key, body_size):
+    import json
+    return json.dumps({
+        "schema_version": 1,
+        "dataset": dataset,
+        "as_of": as_of,
+        "sha256": revision,
+        "revision_sha256": revision,
+        "size_bytes": body_size,
+        "object_key": object_key,
+        "created_at": created_at,
+    }).encode()
+
+
+def test_resolve_latest_revision_uses_immutable_manifests():
+    import hashlib
+    dataset = "indices/membership/nifty_total_market"
+    as_of = "2026-09-18"
+    body1 = b"one"
+    body2 = b"two"
+    r1 = hashlib.sha256(body1).hexdigest()
+    r2 = hashlib.sha256(body2).hexdigest()
+    archive = FakeArchive()
+    archive.objects["obj1"] = body1
+    archive.objects["obj2"] = body2
+    k1 = f"archive/manifests/{dataset}/{as_of}/revisions/{r1}.json"
+    k2 = f"archive/manifests/{dataset}/{as_of}/revisions/{r2}.json"
+    archive.manifests[k1] = _manifest(dataset, as_of, r1, "2026-09-18T10:00:00Z", "obj1", len(body1))
+    archive.manifests[k2] = _manifest(dataset, as_of, r2, "2026-09-18T11:00:00Z", "obj2", len(body2))
+    ref = R2DatasetReader(archive).resolve_latest_revision(dataset, as_of)
+    assert ref.revision_sha256 == r2
+    assert ref.object_key == "obj2"
+
+
+def test_resolve_latest_revision_fails_closed_when_none_exist():
+    with pytest.raises(FileNotFoundError, match="no immutable R2 revisions"):
+        R2DatasetReader(FakeArchive()).resolve_latest_revision(
+            "indices/membership/nifty_total_market", "2026-09-18"
+        )
+
+
+def test_resolve_latest_revision_rejects_non_iso_as_of():
+    with pytest.raises(Exception, match="as_of"):
+        R2DatasetReader(FakeArchive()).resolve_latest_revision(
+            "indices/membership/nifty_total_market", "2026-9-18"
+        )
+
+
+def test_resolve_latest_revision_rejects_missing_created_at():
+    import hashlib
+    dataset = "indices/membership/nifty_total_market"
+    as_of = "2026-09-18"
+    body = b"one"
+    revision = hashlib.sha256(body).hexdigest()
+    archive = FakeArchive()
+    archive.objects["obj"] = body
+    key = f"archive/manifests/{dataset}/{as_of}/revisions/{revision}.json"
+    archive.manifests[key] = _manifest(dataset, as_of, revision, "", "obj", len(body))
+    with pytest.raises(Exception, match="created_at"):
+        R2DatasetReader(archive).resolve_latest_revision(dataset, as_of)
+
+
+def test_resolve_latest_revision_rejects_timezone_less_created_at():
+    import hashlib
+    dataset = "indices/membership/nifty_total_market"
+    as_of = "2026-09-18"
+    body = b"one"
+    revision = hashlib.sha256(body).hexdigest()
+    archive = FakeArchive()
+    archive.objects["obj"] = body
+    key = f"archive/manifests/{dataset}/{as_of}/revisions/{revision}.json"
+    archive.manifests[key] = _manifest(dataset, as_of, revision, "2026-09-18T10:00:00", "obj", len(body))
+    with pytest.raises(Exception, match="timezone"):
+        R2DatasetReader(archive).resolve_latest_revision(dataset, as_of)
+
+
+def test_resolve_revision_rejects_timestamp_as_of():
+    with pytest.raises(Exception, match="invalid as_of date"):
+        R2DatasetReader(FakeArchive()).resolve_revision(
+            "indices/membership/nifty_total_market",
+            "2026-09-18T00:00:00",
+            "a" * 64,
+        )
+
+
+def test_latest_revision_is_the_latest_instant_whatever_the_runner_zone(monkeypatch):
+    """Across a DST fall-back, local wall-clock strings sort the wrong way."""
+    import hashlib
+    import time
+
+    if not hasattr(time, "tzset"):
+        pytest.skip("needs time.tzset")
+    monkeypatch.setenv("TZ", "America/New_York")
+    time.tzset()
+    try:
+        dataset, as_of = "indices/membership/nifty_total_market", "2026-11-01"
+        b1, b2 = b"earlier", b"later"
+        r1, r2 = hashlib.sha256(b1).hexdigest(), hashlib.sha256(b2).hexdigest()
+        archive = FakeArchive()
+        archive.objects["o1"], archive.objects["o2"] = b1, b2
+        base = f"archive/manifests/{dataset}/{as_of}/revisions/"
+        # 05:40Z is 01:40 EDT; 06:10Z is 01:10 EST -- later, but "smaller" locally.
+        archive.manifests[base + f"{r1}.json"] = _manifest(
+            dataset, as_of, r1, "2026-11-01T05:40:00Z", "o1", len(b1))
+        archive.manifests[base + f"{r2}.json"] = _manifest(
+            dataset, as_of, r2, "2026-11-01T06:10:00Z", "o2", len(b2))
+        ref = R2DatasetReader(archive).resolve_latest_revision(dataset, as_of)
+        assert ref.revision_sha256 == r2
+    finally:
+        monkeypatch.delenv("TZ")
+        time.tzset()

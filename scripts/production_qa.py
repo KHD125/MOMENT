@@ -1,0 +1,1444 @@
+"""Umiya V1 production QA — evidence-first, Streamlit-aware.
+
+Design principles (replaces the earlier timeout-escalation harness):
+
+1. Reachability, bootstrap, and application readiness are three DIFFERENT
+   questions. Each is probed and reported separately so a failure can be
+   attributed to the application, the QA harness, or the infrastructure.
+
+2. `/_stcore/health` is NOT a proof of application health on Streamlit
+   Community Cloud: the edge serves the same SPA shell (HTTP 200) for every
+   path. We record what the endpoint actually returned and only treat a
+   literal ``ok`` body as a genuine Streamlit health signal.
+
+3. Readiness is a STATE MACHINE over the real Streamlit DOM, not a single
+   ``get_by_text("Screener")`` wait. The app has distinguishable terminal
+   states (tabs rendered / st.error / st.exception) and one non-terminal
+   state (spinner = data pipeline still running). Reporting *which* state the
+   app is in is the whole point; "did not become visible in N seconds" is not
+   a diagnosis and is never fixed by raising N.
+
+4. The cold data pipeline is expensive, so exactly ONE application session is
+   established and every viewport and tab is exercised against that warm
+   session.
+"""
+from __future__ import annotations
+
+import json
+import os
+import re
+import sys
+import time
+from pathlib import Path
+from urllib.parse import urlparse
+
+import requests
+
+# Both probes drive the app's navigation through ONE implementation; see the
+# module docstring for why. sys.path is primed from __file__ so this resolves
+# whether the script is run directly or loaded by path from a test.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from _streamlit_nav import (  # noqa: E402
+    _close_custom_popover, _open_custom_popover,
+    missing_pages, nav_count, nav_diagnostics, open_page,
+)
+# Imported inside main(), not at module scope. The state classifier below is
+# pure logic and is unit-tested by tests/test_qa_state_classifier.py, which runs
+# in the ordinary validation job where playwright is NOT installed -- it is a QA
+# workflow dependency, not a requirements.txt one. A module-level import made
+# that whole test file uncollectable.
+
+URL = os.getenv("UMIYA_PRODUCTION_URL", "https://paresh.streamlit.app/").rstrip("/") + "/"
+HEALTH_URL = URL.rstrip("/") + "/_stcore/health"
+# The health endpoint that actually belongs to OUR app. Streamlit Community
+# Cloud mounts the app under /~/+/, and only that path reaches the Python
+# process -- it answers the literal body "ok". The bare /_stcore/health above
+# is the wrapper's, and returns the SPA shell for any path, which is why point
+# 2 in this module's docstring exists. Measured 2026-08-18: wrapper 9272 bytes
+# of HTML, app 2 bytes of "ok". This is the only liveness proof available
+# without a browser, and it is what the harness falls back on when one cannot
+# run -- an app whose dependencies failed to install does not answer here.
+APP_HEALTH_URL = URL.rstrip("/") + "/~/+/_stcore/health"
+OUT = Path(os.getenv("UMIYA_QA_OUT", "artifacts/production_qa"))
+
+# Budget for the cold data pipeline. This is a REPORTING horizon, not a pass
+# condition: exceeding it is recorded as an application-performance finding
+# with the state the app was actually in, never silently retried at a larger N.
+READY_BUDGET_S = int(os.getenv("UMIYA_READY_BUDGET_S", "420"))
+POLL_S = 10
+# How long the previous page's menu may stay on screen while the new page's
+# run finishes before it counts as stuck open (audit_configuration).
+MENU_CLOSE_WAIT_MS = 10_000
+# How long the page's own run may take before the menu is judged at all.
+MENU_RUN_WAIT_MS = 60_000
+METRICS_ID = "umiya-startup-metrics"
+# Commit this run intends to test. The workflow passes github.sha; the app
+# publishes the revision it is actually serving. Without this the probe can
+# connect before Streamlit has swapped builds and report a good commit red --
+# which is exactly what happened to c151597, whose QA started two seconds
+# after the push.
+EXPECTED_SHA = (os.getenv("UMIYA_EXPECTED_SHA") or "").strip().lower()
+
+
+def _stale_modules(loaded: str | None, served: str | None) -> list[str]:
+    """src/ files that differ between the code the process imported and disk.
+
+    Streamlit re-executes app.py on every rerun but keeps already-imported
+    modules until the process restarts, and Streamlit Cloud pulls a push
+    without restarting. `served` (git on disk) then says the new commit while
+    everything under src/ is still the build the process started on. That is
+    what hid #177 on 2026-09-25: the menu fix was "served" and not running.
+
+    Only src/ counts: app.py is re-read every run, scripts/ and docs/ never
+    reach the process, and a requirements.txt change restarts it anyway.
+    Empty when there is nothing to compare or git cannot answer.
+    """
+    loaded = (loaded or "").strip().lower()
+    served = (served or "").strip().lower()
+    if not loaded or not served or loaded == served:
+        return []
+    import subprocess
+
+    try:
+        out = subprocess.run(
+            ["git", "diff", "--name-only", loaded, served, "--", "src/"],
+            capture_output=True, text=True, timeout=20,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return []
+    if out.returncode != 0:
+        return []
+    return [ln for ln in out.stdout.splitlines() if ln.strip()]
+
+
+def _serves_expected(served: str) -> bool:
+    """True when the served build IS, or DESCENDS FROM, the triggering commit.
+
+    Exact-match only used to fail every run after a merge that the daily data
+    sync followed within minutes: production was already on the sync commit,
+    which contains the merge, and the probe spent its whole 300 s budget
+    waiting for a swap back to an older build that would never come -- then
+    reported the merge red. Needs the git history (fetch-depth: 0); without it
+    this falls back to exact matching.
+    """
+    served = (served or "").strip().lower()
+    if not served or not EXPECTED_SHA:
+        return False
+    if EXPECTED_SHA.startswith(served[:7]):
+        return True
+    import subprocess
+
+    try:
+        return subprocess.run(
+            ["git", "merge-base", "--is-ancestor", EXPECTED_SHA, served],
+            capture_output=True, timeout=20,
+        ).returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        return False
+DEPLOY_WAIT_S = int(os.getenv("UMIYA_DEPLOY_WAIT_S", "300"))
+# The app emits its telemetry element as the LAST thing the script run does,
+# after all twelve tab bodies. Reading it the instant stTabs appears loses that
+# race every time and reports the deploy check unverifiable, which is what run
+# 32127263814 did. Wait for the element the way cold_start_probe.py does.
+METRICS_WAIT_S = int(os.getenv("UMIYA_METRICS_WAIT_S", "180"))
+
+TABS = [
+    "Screener", "Portfolio", "Actions", "Sectors", "RRG",
+    "Watchlist", "Market Breadth", "Backtest", "Configuration",
+    "Guide",
+]
+VIEWPORTS = {
+    "desktop_1920x1080": (1920, 1080),
+    "desktop_1440x900": (1440, 900),
+    "desktop_1366x768": (1366, 768),
+    "desktop_1280x800": (1280, 800),
+    "desktop_1024x768": (1024, 768),
+    "mobile_390x844": (390, 844),
+    "mobile_375x812": (375, 812),
+    "mobile_360x800": (360, 800),
+}
+
+# Viewports on which the Configuration panel is read value-by-value rather than
+# merely checked for tracebacks. One desktop and the phone size the defect was
+# reported from; doing all eight would triple the run for no new information.
+CONFIG_AUDIT_VIEWPORTS = ("desktop_1280x800", "mobile_390x844")
+
+# Viewports on which EVERY page is opened and rendered. Under `st.tabs` all
+# eleven bodies were already in the DOM, so clicking through them was nearly
+# free; under `st.navigation` each one is a server round trip, and 11 pages x 8
+# viewports is 88 script runs against a single Streamlit Cloud container. Run
+# 301 spent its entire 35-minute workflow budget on that and was killed without
+# printing a verdict.
+#
+# So: open every page on one desktop and on the phone size the config defect was
+# reported from. The other six still check what they exist to check -- that the
+# nav renders, that every page is REACHABLE (including from the overflow
+# dropdown, which is where most of them live on a narrow screen), that nothing
+# threw, and that the layout does not overflow horizontally. What they no
+# longer do is re-render eleven pages that two other viewports just rendered.
+FULL_WALK_VIEWPORTS = ("desktop_1280x800", "mobile_390x844")
+
+RUNTIME_TOKENS = (
+    "Traceback", "KeyError:", "ImportError:", "IndexError:", "TypeError:",
+    "ValueError:", "AttributeError:", "StreamlitAPIException",
+)
+# Streamlit Cloud wrapper states that mean "we never got to the app at all".
+# Needles must be DISTINCTIVE PHRASES from Streamlit Cloud's own wrapper pages.
+# A bare "404" here matched the app's own header -- ">50 EMA: 404 (54%)", the
+# number of stocks above their 50-day EMA -- and run 32129132689 reported a
+# fully rendered, healthy app as cloud_not_found at t=412.4s. Nothing that can
+# occur in ordinary market data belongs in this table.
+CLOUD_STATES = {
+    "asleep": ("has gone to sleep", "get this app back up"),
+    "cloud_error": ("Error running app", "Oh no.", "connection error"),
+    "not_found": ("You do not have access", "page not found",
+                  "404: page not found", "this app does not exist"),
+    "login": ("Sign in to continue", "Continue with Google", "Sign in with"),
+}
+
+
+def classify(msg: str, kind: str) -> dict:
+    """Every failure carries an explicit attribution class."""
+    return {"kind": kind, "detail": msg}
+
+
+def http_probe() -> dict:
+    """HTTP reachability using a cookie-holding session.
+
+    Streamlit Cloud bootstraps an anonymous viewer session via a redirect
+    handshake that MINTS a cookie. A client that discards cookies between
+    redirects sees an infinite redirect loop and misreports the app as down,
+    so a Session (persistent cookie jar) is mandatory here.
+    """
+    session = requests.Session()
+    session.headers["User-Agent"] = (
+        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36"
+    )
+    result: dict = {}
+    for name, target in (("app", URL), ("health", HEALTH_URL),
+                         ("app_health", APP_HEALTH_URL)):
+        started = time.perf_counter()
+        try:
+            r = session.get(target, timeout=45, allow_redirects=True)
+            body = r.text[:200]
+            result[name] = {
+                "status": r.status_code,
+                "elapsed_s": round(time.perf_counter() - started, 2),
+                "final_url": r.url,
+                "bytes": len(r.content),
+                "redirects": len(r.history),
+                # A real Streamlit health endpoint answers with the literal
+                # body "ok". Anything else here is the Cloud SPA shell and
+                # says nothing about whether the Python app is alive.
+                "is_streamlit_health_ok": body.strip().lower().startswith("ok"),
+                "looks_like_spa_shell": "<!doctype html" in body.lower(),
+            }
+        except Exception as exc:
+            result[name] = {
+                "error": f"{type(exc).__name__}: {exc}",
+                "elapsed_s": round(time.perf_counter() - started, 2),
+            }
+    return result
+
+
+def read_telemetry(page) -> dict | None:
+    """The running app's startup telemetry, or None if it has not emitted yet."""
+    for frame in page.frames:
+        try:
+            node = frame.locator(f"#{METRICS_ID}")
+            if node.count() == 0:
+                continue
+            raw = node.first.text_content(timeout=5_000)
+            if raw:
+                return json.loads(raw) or {}
+        except Exception:
+            continue
+    return None
+
+
+def read_revision(page, wait_s: int = 0) -> tuple[str | None, str]:
+    """Revision the running app reports, plus why it could not be read.
+
+    Returns (revision, reason). The reason distinguishes the two ways this can
+    come back empty -- the app never published telemetry at all, versus it
+    published telemetry that carries no revision -- because they have different
+    causes and only the second one is about git metadata on the Streamlit host.
+    """
+    deadline = time.perf_counter() + max(0, wait_s)
+    telemetry = read_telemetry(page)
+    while telemetry is None and time.perf_counter() < deadline:
+        time.sleep(POLL_S)
+        telemetry = read_telemetry(page)
+
+    if telemetry is None:
+        return None, "no_telemetry_element"
+    rev = telemetry.get("revision")
+    if not rev:
+        return None, "telemetry_without_revision"
+    return rev, "ok"
+
+
+def app_frame(page):
+    """Return the frame that actually hosts the Streamlit app.
+
+    Streamlit Community Cloud serves a wrapper SPA and mounts the app inside a
+    nested iframe. Querying only the top-level frame finds an empty body no
+    matter how long you wait, which is exactly how a healthy app gets
+    misreported as "never rendered".
+    """
+    for frame in page.frames:
+        try:
+            if frame.locator('[data-testid="stApp"]').count() > 0:
+                return frame
+        except Exception:
+            continue
+    # Fall back to the largest non-blank frame, then the main frame. Only
+    # frames on the app's own host: Community Cloud also embeds a
+    # statuspage.io widget, and on 2026-09-26 this fallback returned it, so
+    # the ticker probe searched the status widget for tickers.
+    app_host = urlparse(page.url).netloc
+    for frame in page.frames:
+        try:
+            if urlparse(frame.url).netloc not in ("", app_host):
+                continue
+            if frame != page.main_frame and frame.locator("body").inner_text(
+                    timeout=2_000).strip():
+                return frame
+        except Exception:
+            continue
+    return page.main_frame
+
+
+def read_data_source(page, wait_s: float = 30.0) -> str:
+    """The footer's "Data from:" value: R2, or which files came from the release.
+
+    Empty when the footer never showed it (the loaders recorded nothing)."""
+    deadline = time.perf_counter() + wait_s
+    while True:
+        try:
+            body = app_frame(page).locator("body").inner_text(timeout=10_000)
+        except Exception:
+            body = ""
+        match = re.search(r"Data from:\s*([^\n·]+)", body)
+        if match or time.perf_counter() >= deadline:
+            return match.group(1).strip() if match else ""
+        time.sleep(POLL_S)
+
+
+def read_state(page) -> dict:
+    """Classify what the browser is ACTUALLY showing right now."""
+    frame = app_frame(page)
+    frames_info = [f.url[:120] for f in page.frames]
+    try:
+        body = frame.locator("body").inner_text(timeout=10_000)
+    except Exception as exc:
+        return {"state": "dom_unreadable", "detail": str(exc)[:200],
+                "frames": frames_info, "body": ""}
+
+    def count(sel: str) -> int:
+        try:
+            return frame.locator(sel).count()
+        except Exception:
+            return 0
+
+    st_exception = count('[data-testid="stException"]')
+    # The app's own navigation, whichever primitive renders it. It moved from
+    # `st.tabs` to `st.navigation(position="top")` so that only the active page
+    # executes; readiness means "the app's nav is on screen", not "stTabs
+    # exists". Both are accepted so this classifier survives the migration in
+    # either direction.
+    st_tabs = nav_count(frame)
+    st_spinner = count('[data-testid="stSpinner"]')
+    st_app = count('[data-testid="stApp"]')
+
+    info = {
+        "body_len": len(body),
+        "stApp": st_app, "stNav": st_tabs,
+        # Only when the nav is missing: say what IS there.
+        **({"nav_dom": nav_diagnostics(frame)} if not st_tabs and st_app else {}),
+        "stSpinner": st_spinner, "stException": st_exception,
+        "n_frames": len(page.frames),
+        "frames": frames_info,
+        "body_head": body[:300].replace("\n", " | "),
+    }
+
+    # Only the WRAPPER can be in a cloud state. If Streamlit has rendered the
+    # app's navigation then we are looking at the application itself, and any
+    # resemblance to wrapper text is the app's own content -- belt and braces
+    # alongside the phrase list above.
+    if not st_tabs:
+        for label, needles in CLOUD_STATES.items():
+            if any(n.lower() in body.lower() for n in needles):
+                return {"state": f"cloud_{label}", **info}
+
+    if st_exception:
+        return {"state": "app_exception", **info}
+    # Either spelling: the app said "initialize" until 12 Oct 2026.
+    if "Failed to initialise market data" in body or "Failed to initialize market data" in body:
+        return {"state": "app_data_init_failed", **info}
+    if st_tabs:
+        return {"state": "ready", **info}
+    if st_spinner or "Loading market data" in body:
+        return {"state": "pipeline_running", **info}
+    # Current production uses a keyed custom navigation container whose page-link
+    # DOM can be absent from the frame inspected by the probe even though the
+    # application itself is fully rendered. The stable application shell markers
+    # below are emitted by the live Screener page; use them as a readiness proof
+    # only when Streamlit has mounted the app, no spinner is active, and no
+    # exception/data-init failure was detected above.
+    if st_app and "Universe:" in body and "NIFTY" in body:
+        return {"state": "ready", **info}
+    if st_app and len(body.strip()) == 0:
+        return {"state": "app_shell_blank", **info}
+    return {"state": "unknown", **info}
+
+
+
+DEEP_LINK_SYMBOL = os.getenv("UMIYA_DEEP_LINK_SYMBOL", "WELCORP")
+
+
+def audit_nav_styling(frame) -> dict:
+    """Is the navigation CSS actually reaching the browser?
+
+    The nav is styled by class (`.st-key-app_nav`), which depends on Streamlit
+    emitting an `st-key-` class for a keyed container and on the app's
+    stylesheet being injected before the row renders. Both are true in theory.
+    This app has spent a day proving that theory and the deployed DOM are
+    different questions, so read the COMPUTED style off a real nav link.
+
+    Reports rather than asserts exact pixels: the values are design choices and
+    will change. What it catches is the stylesheet not applying at all, which
+    is the failure that looks identical to "you are on an older build".
+    """
+    out: dict = {}
+    try:
+        row = frame.locator('[class*="st-key-app_nav"]').first
+        out["nav_row_present"] = bool(row.count())
+        # The links are not inside the header row. The ☰ popover renders its
+        # body in a floating overlay elsewhere in the document, and only while
+        # it is open -- so this looked inside the row, found nothing on every
+        # run, and reported "no page link" instead of ever measuring the CSS.
+        opened = _open_custom_popover(frame)
+        link = frame.locator(
+            '[data-testid="stPopoverBody"] [data-testid="stPageLink"] a').first
+        if not link.count():
+            out["error"] = (
+                "no page link in the navigation menu"
+                + ("" if opened else " (the menu did not open)"))
+            return out
+        out.update(link.evaluate(
+            "el => { const s = getComputedStyle(el); return {"
+            "  font_size: s.fontSize, font_weight: s.fontWeight,"
+            "  color: s.color, background: s.backgroundColor,"
+            "  border_radius: s.borderRadius, height: s.height }; }"))
+        active = frame.locator(
+            '[data-testid="stPopoverBody"] [class*="st-key-navon_"] '
+            '[data-testid="stPageLink"] a').first
+        out["active_marked"] = bool(active.count())
+        if active.count():
+            out["active_color"] = active.evaluate(
+                "el => getComputedStyle(el).color")
+        # theme.py sets the menu links to 13px; the browser default is ~16px.
+        # If this reads like the default, the stylesheet is not applying.
+        out["css_applied"] = out.get("font_size", "") not in ("", "16px")
+        # How much of the screen the menu eats before any content. It shipped
+        # as a six-row ~500px block on a phone because each per-item container
+        # defaulted to width="stretch"; a number makes that a measurement
+        # rather than an impression.
+        box = row.bounding_box()
+        if box:
+            out["row_height_px"] = round(box["height"])
+            out["row_width_px"] = round(box["width"])
+            vp = frame.page.viewport_size if hasattr(frame, "page") else None
+            if vp and vp.get("height"):
+                out["row_pct_of_viewport"] = round(
+                    100 * box["height"] / vp["height"])
+    except Exception as exc:
+        out["error"] = f"{type(exc).__name__}: {exc}"[:180]
+    finally:
+        _close_custom_popover(frame)
+    return out
+
+
+def audit_stock_link_navigation(page) -> dict:
+    """Where clicking a ticker actually lands, and what the trip costs.
+
+    The screener table is a sandboxed component iframe with no
+    allow-top-navigation, so it cannot navigate the page around it; the app
+    injects a script into `window.parent` to do it instead (src/ui/theme.py).
+    `window.parent` is the Streamlit app document, mounted by Community Cloud
+    at /~/+/, which is why a ticker click leaves `/~/+/?stock=SYM` in the
+    address bar.
+
+    Whether pointing that at `window.top` would help depends on two things
+    nobody should guess at: whether the app document IS the top document, and
+    whether navigating the top costs a full wrapper reload on every click. This
+    measures both instead of arguing about them.
+    """
+    out: dict = {}
+    # Go to the Screener first. The previous run measured nothing because the
+    # config audit had left the browser on Configuration, where there are no
+    # tickers to click -- the probe reported "no ticker link found" and the
+    # cost question went unanswered for a round.
+    frame = app_frame(page)
+    try:
+        open_page(frame, "Screener", page)
+        settle_after_nav(page, frame)
+        frame = app_frame(page)
+    except Exception as exc:
+        out["navigate_to_screener"] = f"{type(exc).__name__}: {exc}"[:140]
+    try:
+        out["frame_shape"] = frame.evaluate("""() => ({
+            self_url: location.href,
+            is_top_document: window === window.top,
+            parent_url: (() => { try { return parent.location.href; }
+                                 catch (e) { return 'blocked:' + e.name; } })(),
+            top_url: (() => { try { return top.location.href; }
+                              catch (e) { return 'blocked:' + e.name; } })()
+        })""")
+    except Exception as exc:
+        out["frame_shape"] = {"error": f"{type(exc).__name__}: {exc}"[:140]}
+
+    # Ticker links come in two shapes, and they navigate differently:
+    #
+    #   Screener table  <a data-stock=...> (and the whole <tr data-stock>)
+    #               inside a SANDBOXED COMPONENT IFRAME; the click is
+    #               intercepted and a script injected into window.parent
+    #               (src/ui/screener_table.py, all three column sets)
+    #   Plain links <a href="?stock=..." target="_self"> in the app document:
+    #               Top 50 this month, peers on the stock page, sector leaders
+    #
+    # The card view that used to be the default is gone; `a.sq-sym` stays in
+    # the selector list below only so an older deployment still measures.
+    # Record which shape was found and in which frame, because the fix for
+    # the ugly URL differs between them.
+    link = None
+    for _attempt in range(10):  # the Screener may still be rendering
+        link = _find_ticker_link(page, out)
+        if link is not None:
+            break
+        page.wait_for_timeout(2_000)
+    if link is None:
+        out["click"] = {
+            "error": "no ticker link found",
+            "frames": [f.url[:100] for f in page.frames],
+        }
+        return out
+    return _click_ticker(page, link, out)
+
+
+def _find_ticker_link(page, out: dict):
+    for selector in ("a[data-stock]", "a.sq-sym", 'a[href*="stock="]'):
+        for f in page.frames:
+            try:
+                # The first match can be hidden (a collapsed layout) or sit under
+                # Cloud's "Manage app" overlay: on 2026-09-26 a click on it timed
+                # out after 15s. Take the first one that is actually visible.
+                matches = f.locator(selector)
+                candidate = None
+                for i in range(min(matches.count(), 20)):
+                    if matches.nth(i).is_visible():
+                        candidate = matches.nth(i)
+                        break
+                if candidate is not None:
+                    out["link_found"] = {
+                        "selector": selector,
+                        "frame_url": f.url[:120],
+                        "in_component_iframe": f.url.startswith("about:"),
+                        "href": candidate.get_attribute("href"),
+                        "target": candidate.get_attribute("target"),
+                    }
+                    return candidate
+            except Exception:
+                continue
+    return None
+
+
+def _click_ticker(page, link, out: dict) -> dict:
+    try:
+        symbol = link.get_attribute("data-stock") or (link.inner_text() or "").strip()
+        before = page.url
+        started = time.perf_counter()
+        try:
+            link.scroll_into_view_if_needed(timeout=5_000)
+            link.click(timeout=15_000)
+            out["clicked_via"] = "pointer"
+        except Exception:
+            # Still the browser following the anchor, just without the
+            # pointer hit-test that an overlay can intercept.
+            link.evaluate("el => el.click()")
+            out["clicked_via"] = "script"
+        # Wait for the CHANGE, not for readiness. The app is already "ready"
+        # when the click happens, so a readiness loop exits on its first
+        # iteration and reports whatever was on screen 0.1s later -- which is
+        # how this measurement first concluded a ticker click does nothing.
+        # Stop when the stock page appears or the URL moves, whichever first.
+        state: dict = {}
+        deadline = time.monotonic() + 60
+        while time.monotonic() < deadline:
+            state = read_state(page)
+            if state.get("state") == "app_exception":
+                break
+            if page.url != before:
+                break
+            try:
+                if "Back to screener" in app_frame(page).locator(
+                        "body").inner_text(timeout=5_000):
+                    break
+            except Exception:
+                pass
+            page.wait_for_timeout(1_000)
+        elapsed = round(time.perf_counter() - started, 1)
+        # The address bar follows the app's st.query_params write, which the
+        # host page applies on a message; give it a moment before reading.
+        for _ in range(10):
+            if "stock=" in page.url:
+                break
+            page.wait_for_timeout(500)
+        try:
+            body = app_frame(page).locator("body").inner_text(timeout=10_000)
+        except Exception:
+            body = ""
+        out["click"] = {
+            "symbol": symbol,
+            "from": before[:120],
+            "to": page.url[:120],
+            "seconds": elapsed,
+            "state": state.get("state"),
+            "reached_stock_page": "Back to screener" in body,
+        }
+    except Exception as exc:
+        out["click"] = {"error": f"{type(exc).__name__}: {exc}"[:180]}
+    return out
+
+
+def audit_deep_links(page) -> dict:
+    """Which shareable URL forms actually reach the app.
+
+    The app's own links are RELATIVE -- `?stock=SYM` -- so they resolve against
+    whatever path the app process is mounted at. On Streamlit Community Cloud
+    that is `/~/+/`, which is why a reader who opens a stock ends up with
+    `paresh.streamlit.app/~/+/?stock=WELCORP` in the address bar rather than
+    something they would want to send anyone.
+
+    Whether the SHORT form reaches the same place is a property of the host's
+    wrapper, not of this repository, so it is measured here instead of assumed.
+    Deep links are how a reader shares a stock, and nothing tested them against
+    production until now.
+    """
+    forms = {
+        "short_query": f"{URL}?stock={DEEP_LINK_SYMBOL}",
+        "mounted_query": f"{URL}~/+/?stock={DEEP_LINK_SYMBOL}",
+        "short_page": f"{URL}configuration",
+        "mounted_page": f"{URL}~/+/configuration",
+    }
+    out: dict = {}
+    for label, target in forms.items():
+        try:
+            page.goto(target, wait_until="domcontentloaded", timeout=90_000)
+            state: dict = {}
+            deadline = time.monotonic() + 120
+            while time.monotonic() < deadline:
+                state = read_state(page)
+                if state.get("state") in ("ready", "app_exception"):
+                    break
+                page.wait_for_timeout(2_000)
+            frame = app_frame(page)
+            try:
+                body = frame.locator("body").inner_text(timeout=10_000)
+            except Exception:
+                body = ""
+            out[label] = {
+                "final_url": page.url[:160],
+                "state": state.get("state"),
+                "reached_stock_page": "Back to screener" in body,
+                "symbol_shown": DEEP_LINK_SYMBOL in body,
+            }
+        except Exception as exc:
+            out[label] = {"error": f"{type(exc).__name__}: {exc}"[:180]}
+    return out
+
+
+def settle_after_nav(page, frame, budget_ms: int = 12_000) -> float:
+    """Wait for the page's script run to finish, not for a fixed interval.
+
+    Under `st.navigation` a page change runs a fresh script on the server, so
+    the DOM is not already present behind a CSS toggle the way `st.tabs` left
+    it. A constant sleep has to be sized for the slowest page (the backtest) and
+    is then wasted on every fast one -- eleven pages times eight viewports, so
+    every needless second costs a minute and a half of wall clock.
+
+    Returns the seconds actually waited, so the walk can report where its time
+    went instead of leaving that to be guessed from a timeout.
+    """
+    started = time.perf_counter()
+    deadline = started + budget_ms / 1000.0
+    settled_for = 0.0
+    while time.perf_counter() < deadline:
+        try:
+            busy = frame.locator('[data-testid="stSpinner"]').count()
+        except Exception:
+            busy = 0
+        if busy:
+            settled_for = 0.0
+        else:
+            settled_for += 0.15
+            if settled_for >= 0.45:
+                break
+        page.wait_for_timeout(150)
+    return round(time.perf_counter() - started, 2)
+
+
+SECTION_CONTROL_WAIT_MS = 20_000
+# Configuration's sections, by the names this probe has always used, to the
+# anchors of the one-page layout's index links.
+SECTION_ANCHORS = {
+    "Data & Sync": "cfg-universe",
+    "Momentum Signal": "cfg-score",
+    "Portfolio Risk": "cfg-limits",
+    "Data Health": "cfg-health",
+}
+
+
+def _find_section_control(page, frame, section: str,
+                          wait_ms: int = SECTION_CONTROL_WAIT_MS):
+    """The Configuration left-nav control for `section`, waiting for it to render.
+
+    Looked once, 1.8 s after open_page, until run 580: on mobile open_page is
+    a full reload of the route, the page was still rendering, and a healthy
+    panel was reported as "Momentum Signal: no control found".
+
+    Returns (locator, "label" | "role") or (None, "none") once `wait_ms` has
+    passed without either appearing.
+    """
+    waited = 0
+    while True:
+        try:
+            # One page since the redesign: every section is always rendered,
+            # and the index at the top links to each. Following the link is
+            # the reader's motion, and proves the section is on the page.
+            anchor = SECTION_ANCHORS.get(section)
+            if anchor:
+                link = frame.locator(f'.cfg-index a[href="#{anchor}"]').first
+                if link.count():
+                    return link, "label"
+            # The earlier tabbed layout, kept so the probe can still read a
+            # deploy that predates it.
+            grp = frame.locator('[data-testid="stRadio"]').filter(
+                has_text="Momentum Signal")
+            if grp.count():
+                lab = grp.first.locator("label").filter(has_text=section).first
+                if lab.count():
+                    return lab, "label"
+            opt = frame.get_by_role(
+                "radio", name=re.compile(re.escape(section))).first
+            if opt.count():
+                return opt, "role"
+        except Exception:
+            pass  # re-rendering under us; look again
+        if waited >= wait_ms:
+            return None, "none"
+        page.wait_for_timeout(500)
+        waited += 500
+
+
+def audit_configuration(page, frame) -> dict:
+    """Read the momentum weight panel off the LIVE app, and try to repair it.
+
+    Run 295 reproduced the report at last, on desktop_1280x800:
+
+        sliders  1M=0.00 3M=0.00 6M=0.00 9M=0.00 12M=0.00
+        pill     10% 30% 30% 20% 10%
+
+    So session state is NOT zeroed -- the pill is computed from it six lines
+    above the sliders and reads correctly -- yet the sliders render at their
+    minimum. That is the signature of session state not reaching the widget,
+    and four local environments render it correctly, so keep measuring rather
+    than guessing: record which nav clicks land, what the build chip says, one
+    slider's markup verbatim, and what the panel's own "Reset to defaults"
+    button does, which writes the five keys unconditionally.
+
+    Returns evidence. Judging it is the caller's job.
+    """
+    out: dict = {"panel_reached": False, "nav_trace": []}
+    # The page was just chosen from the ☰ menu. A menu still open now is one
+    # the reader has to dismiss by hand, covering part of the page.
+    #
+    # Judged after the page's run has had time to finish: Streamlit keeps the
+    # previous page's elements, the old menu included, on screen until the new
+    # run completes, so a check the moment the Configuration panel appears
+    # caught that old menu mid-run (runs on 9e64c72 and 7a4de54, with no
+    # header change behind either). A menu the reader must close by hand is
+    # one still open once the run is over; that is what fails.
+    #
+    # "Once the run is over" is read from Streamlit's own running indicator,
+    # not a fixed wait: minutes after a deploy a cold page run takes longer
+    # than MENU_CLOSE_WAIT_MS (run on 2ae8c88: Portfolio and Breadth took 16s
+    # in the same pass, and Configuration's menu was judged mid-run).
+    try:
+        body = frame.locator('[data-testid="stPopoverBody"]').first
+        running = frame.locator('[data-testid="stStatusWidget"]')
+        open_ms = run_ms = 0
+        while run_ms <= MENU_RUN_WAIT_MS and running.count():
+            page.wait_for_timeout(500)
+            run_ms += 500
+        while open_ms <= MENU_CLOSE_WAIT_MS and body.count() and body.is_visible():
+            page.wait_for_timeout(500)
+            open_ms += 500
+        out["menu_open_after_nav"] = bool(body.count() and body.is_visible())
+        out["menu_closed_after_ms"] = open_ms
+        out["page_run_ms"] = run_ms
+    except Exception:
+        out["menu_open_after_nav"] = None
+
+    def slider_values() -> dict:
+        """Label -> displayed value, from Streamlit's own thumb readout.
+
+        Read the thumb by its test id rather than by position in the widget's
+        text: the track also prints its min and max, and a parser that trusts
+        "the second line" would report the range instead of the value the
+        moment Streamlit reorders that markup -- reading 0.00 for a healthy
+        slider, which is the very symptom under investigation.
+
+        Every read is individually guarded. Streamlit re-renders while this
+        runs, so a handle resolved a moment ago can be detached by the time it
+        is read; run 295 lost the whole mobile viewport to one such timeout.
+        One unreadable slider must cost one slider.
+        """
+        vals: dict = {}
+        items = frame.locator('[data-testid="stSlider"]')
+        try:
+            n = items.count()
+        except Exception:
+            return vals
+        for i in range(n):
+            try:
+                node = items.nth(i)
+                try:
+                    label = node.locator(
+                        '[data-testid="stWidgetLabel"]'
+                    ).first.inner_text(timeout=2_000).strip()
+                except Exception:
+                    label = ""
+                raw = ""
+                thumb = node.locator('[data-testid="stSliderThumbValue"]').first
+                if thumb.count():
+                    raw = thumb.inner_text(timeout=2_000).strip()
+                if not label or not raw:
+                    lines = [ln.strip() for ln in
+                             node.inner_text(timeout=2_000).splitlines() if ln.strip()]
+                    if not label and lines:
+                        label = lines[0]
+                    if not raw and len(lines) > 1:
+                        raw = lines[1]
+                m = re.search(r"-?\d+(?:\.\d+)?", raw)
+                if label and m:
+                    vals[label] = float(m.group())
+            except Exception:
+                continue
+        return vals
+
+    def pill_percentages():
+        """The normalised vector the panel CLAIMS, parsed from its own pill."""
+        try:
+            body = frame.locator("body").inner_text(timeout=10_000)
+        except Exception:
+            return None
+        m = re.search(r"Weight vector:\s*([0-9%·.\s]+)", body)
+        if not m:
+            return None
+        return [float(x) for x in re.findall(r"(\d+(?:\.\d+)?)%", m.group(1))]
+
+    def goto(section: str) -> bool:
+        """Select a left-nav section the way a person does: by its label.
+
+        Streamlit renders a radio option as a visually hidden <input> behind a
+        styled wrapper, so `get_by_role("radio")` resolves to an element that
+        the wrapper divs intercept every pointer event for. Run 294 spent its
+        full 20s retry budget on each and reported a timeout instead of an
+        answer. Click the label; force-click the input only as a fallback.
+        """
+        target, how = _find_section_control(page, frame, section)
+        if target is None:
+            out["nav_trace"].append(f"{section}: no control found")
+            return False
+        for force in (False, True):
+            try:
+                target.click(timeout=8_000, force=force)
+                page.wait_for_timeout(1_500)
+                out["nav_trace"].append(
+                    f"{section}: clicked via {how}{' (forced)' if force else ''}")
+                return True
+            except Exception as exc:
+                last = f"{type(exc).__name__}"
+        out["nav_trace"].append(f"{section}: click failed via {how} ({last})")
+        return False
+
+    WEIGHT_LABELS = ("1M", "3M", "6M", "9M", "12M")
+
+    def snapshot() -> dict:
+        vals = slider_values()
+        return {
+            "sliders": vals,
+            "weights": {k: vals[k] for k in WEIGHT_LABELS if k in vals},
+            "pill": pill_percentages(),
+        }
+
+    def on_screen(snap: dict) -> bool:
+        return len(snap.get("weights") or {}) >= 3
+
+    # Momentum Signal is not the nav's default section, so the click has to
+    # land -- but look anyway before giving up, in case it did and something
+    # else went wrong.
+    goto("Momentum Signal")
+    first = snapshot()
+    if not on_screen(first):
+        out["error"] = (
+            f"lookback sliders not on screen; read {sorted(first.get('sliders') or {})}")
+        return out
+    out["panel_reached"] = True
+    out["initial"] = first
+
+    # What the process says it is running. This was briefly a chip in the
+    # Configuration status bar; it is diagnostic plumbing, not something a
+    # reader should have to look at, so it lives in the hidden telemetry
+    # element that the deploy-correspondence check already reads.
+    try:
+        # The value is not read; the CALL is what matters. It blocks until the
+        # body has text (or raises into the except below), which is what keeps
+        # read_telemetry from sampling a frame that has not rendered yet.
+        frame.locator("body").inner_text(timeout=10_000)
+        tele = read_telemetry(page) or {}
+        out["build_chip"] = (tele.get("revision") or "")[:7] or None
+        out["streamlit_version"] = tele.get("streamlit_version")
+    except Exception:
+        out["build_chip"] = None
+        out["streamlit_version"] = None
+
+    # One slider's markup verbatim. If the DOM carries a correct aria-valuenow
+    # while the thumb prints 0.00, that is a rendering fault; if the markup
+    # says zero too, the value never left Python.
+    try:
+        node = frame.locator('[data-testid="stSlider"]').filter(
+            has_text=re.compile(r"^\s*1M\s")).first
+        if node.count():
+            out["first_weight_slider_html"] = node.evaluate(
+                "el => el.outerHTML")[:1200]
+    except Exception as exc:
+        out["first_weight_slider_html"] = f"unreadable: {type(exc).__name__}"
+
+    # The eviction sequence: Streamlit discards widget state for any key whose
+    # widget did not render on the previous run, and these sections render one
+    # at a time, so a round trip is precisely the motion said to zero them.
+    if goto("Portfolio Risk"):
+        out["risk_sliders"] = slider_values()
+        if goto("Momentum Signal"):
+            after = snapshot()
+            if on_screen(after):
+                out["after_nav"] = after
+
+    # The unconditional repair. The button overwrites all five keys with plain
+    # floats and reruns, so if the sliders still read zero afterwards, no write
+    # to session state reaches these widgets at all.
+    try:
+        btn = frame.get_by_role("button", name=re.compile("Reset to defaults")).first
+        if btn.count():
+            btn.click(timeout=8_000)
+            page.wait_for_timeout(2_500)
+            after = snapshot()
+            if on_screen(after):
+                out["after_reset"] = after
+        else:
+            out["after_reset_error"] = "reset button not found"
+    except Exception as exc:
+        out["after_reset_error"] = f"{type(exc).__name__}: {exc}"
+
+    return out
+
+
+def judge_configuration(name: str, ev: dict) -> list:
+    """Turn the Configuration evidence into failures, or nothing."""
+    found = []
+    if not ev.get("panel_reached"):
+        return [classify(
+            f"{name}/Configuration: could not reach the Momentum Signal panel "
+            f"({ev.get('error', 'unknown')})", "QA")]
+
+    for phase in ("initial", "after_nav", "after_reset"):
+        snap = ev.get(phase)
+        if not snap:
+            continue
+        sliders = snap.get("sliders") or {}
+        weights = snap.get("weights") or {
+            k: v for k, v in sliders.items() if k in ("1M", "3M", "6M", "9M", "12M")}
+        if len(weights) != 5:
+            found.append(classify(
+                f"{name}/Configuration [{phase}]: expected 5 lookback sliders, "
+                f"read {sorted(weights)} from {sorted(sliders)}", "QA"))
+            continue
+
+        order = ["1M", "3M", "6M", "9M", "12M"]
+        shown = [weights[k] for k in order]
+        if sum(shown) <= 0:
+            extra = ""
+            if phase == "after_reset":
+                extra = (" -- and this is AFTER the panel's own Reset to "
+                         "defaults button wrote all five keys, so no write to "
+                         "session state is reaching these widgets")
+            found.append(classify(
+                f"{name}/Configuration [{phase}]: every lookback slider reads "
+                f"{shown} -- a zeroed weight vector cannot rank anything, and "
+                f"touching one slider submits the displayed zeros for the rest"
+                + extra,
+                "APPLICATION"))
+            continue
+
+        pill = snap.get("pill")
+        if pill is None:
+            found.append(classify(
+                f"{name}/Configuration [{phase}]: weight-vector pill not found",
+                "QA"))
+            continue
+        if len(pill) != 5:
+            found.append(classify(
+                f"{name}/Configuration [{phase}]: pill parsed as {pill}", "QA"))
+            continue
+        tot = sum(shown)
+        norm = [100.0 * w / tot for w in shown]
+        drift = [abs(a - b) for a, b in zip(norm, pill)]
+        # The pill rounds to whole percent, so 1pp of disagreement is rounding.
+        if max(drift) > 1.5:
+            found.append(classify(
+                f"{name}/Configuration [{phase}]: sliders normalise to "
+                f"{[round(x) for x in norm]}% but the pill claims {pill}% -- "
+                f"the panel disagrees with itself about the live weights",
+                "APPLICATION"))
+
+    # menu_open_after_nav stays in the report but no longer fails the run:
+    # on the 390x844 viewport it read "still open" on every run from 2 Oct
+    # while the menu closes in real use -- a headless timing artefact of the
+    # capture, not the app (owner, 2026-10-03: "in real no issue, close it").
+    # The reset is the check that proves writes reach the widgets. Failing to
+    # click it used to be printed and then passed (run 570, desktop).
+    if ev.get("after_reset_error"):
+        found.append(classify(
+            f"{name}/Configuration: Reset to defaults could not be exercised: "
+            f"{str(ev['after_reset_error']).splitlines()[0][:160]}", "QA"))
+
+    before = (ev.get("initial") or {}).get("sliders")
+    after = (ev.get("after_nav") or {}).get("sliders")
+    if before and after and before != after:
+        found.append(classify(
+            f"{name}/Configuration: navigating away and back changed the "
+            f"sliders from {before} to {after}", "APPLICATION"))
+    return found
+
+
+def main() -> None:
+    OUT.mkdir(parents=True, exist_ok=True)
+    failures: list[dict] = []
+    report: dict = {"url": URL, "ready_budget_s": READY_BUDGET_S}
+
+    report["http_probe"] = probe = http_probe()
+    print("HTTP probe:", json.dumps(probe, indent=2), flush=True)
+
+    app_probe = probe.get("app", {})
+    if app_probe.get("status") != 200:
+        failures.append(classify(
+            f"App URL did not return 200 over HTTP: {app_probe}", "INFRASTRUCTURE"))
+
+    ws_events: list[str] = []
+    console_errors: list[str] = []
+    page_errors: list[str] = []
+    bad_responses: list[str] = []
+    # Chrome's console message for a failed subresource is "Failed to load
+    # resource: the server responded with a status of 404 ()" -- with no URL in
+    # the text. Five of those were reported and could not be explained from the
+    # console alone. Record the responses themselves so a 404 names the thing
+    # that is missing instead of being a number to shrug at.
+    not_found: list[str] = []
+    timeline: list[dict] = []
+
+    from playwright.sync_api import sync_playwright
+
+    with sync_playwright() as p:
+        launch: dict = {"headless": True, "args": ["--no-sandbox"]}
+        exe = os.getenv("UMIYA_CHROMIUM_PATH")
+        if exe:
+            launch["executable_path"] = exe
+        browser = p.chromium.launch(**launch)
+        context = browser.new_context(
+            viewport={"width": 1920, "height": 1080},
+            user_agent=(
+                "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                "(KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36"
+            ),
+        )
+        page = context.new_page()
+        page.on("websocket", lambda ws: ws_events.append(f"open {ws.url[:160]}"))
+        page.on("console", lambda m: console_errors.append(f"[{m.type}] {m.text[:250]}")
+                if m.type == "error" else None)
+        page.on("pageerror", lambda e: page_errors.append(str(e)[:250]))
+        page.on("response", lambda r: bad_responses.append(f"{r.status} {r.url[:160]}")
+                if r.status >= 500 else None)
+        page.on("response", lambda r: not_found.append(f"{r.status} {r.url[:200]}")
+                if r.status == 404 else None)
+
+        state = {"state": "not_started"}
+        started = time.perf_counter()
+        try:
+            page.goto(URL, wait_until="domcontentloaded", timeout=120_000)
+            report["goto_s"] = round(time.perf_counter() - started, 1)
+            report["url_after_goto"] = page.url
+
+            # Poll the readiness state machine. We stop as soon as the app
+            # reaches ANY terminal state -- ready or broken -- instead of
+            # blindly waiting out the clock on a single selector.
+            deadline = time.perf_counter() + READY_BUDGET_S
+            while time.perf_counter() < deadline:
+                state = read_state(page)
+                sample = {"t_s": round(time.perf_counter() - started, 1), **state}
+                timeline.append(sample)
+                print(json.dumps({k: v for k, v in sample.items() if k != "body"})[:500],
+                      flush=True)
+                if state["state"] in ("ready", "app_exception", "app_data_init_failed"):
+                    break
+                if state["state"].startswith("cloud_"):
+                    break
+                time.sleep(POLL_S)
+
+            report["ready_state"] = state["state"]
+            report["ready_after_s"] = round(time.perf_counter() - started, 1)
+            if state["state"] == "ready":
+                report["data_source"] = read_data_source(page)
+
+            # Deploy correspondence. If the app is still serving the previous
+            # commit, this run's result says nothing about the commit that
+            # triggered it, so wait for the swap and record what happened
+            # rather than reporting the new commit red.
+            if state["state"] == "ready" and EXPECTED_SHA:
+                deadline_dep = time.perf_counter() + DEPLOY_WAIT_S
+                served, why = read_revision(page, wait_s=METRICS_WAIT_S)
+                while (
+                    served
+                    and not _serves_expected(served)
+                    and time.perf_counter() < deadline_dep
+                ):
+                    print(json.dumps({
+                        "waiting_for_deploy": EXPECTED_SHA[:7],
+                        "currently_served": served[:7],
+                        "t_s": round(time.perf_counter() - started, 1),
+                    }), flush=True)
+                    time.sleep(POLL_S)
+                    page.reload(wait_until="domcontentloaded", timeout=120_000)
+                    for _ in range(int(READY_BUDGET_S / POLL_S)):
+                        if read_state(page)["state"] == "ready":
+                            break
+                        time.sleep(POLL_S)
+                    served, why = read_revision(page, wait_s=METRICS_WAIT_S)
+
+                report["expected_revision"] = EXPECTED_SHA[:7]
+                report["served_revision"] = (served or "unknown")[:7]
+                loaded = (read_telemetry(page) or {}).get("loaded_revision")
+                report["loaded_revision"] = (loaded or "unknown")[:7]
+                stale = _stale_modules(loaded, served)
+                if stale:
+                    report["stale_modules"] = stale
+                    failures.append(classify(
+                        f"Production has {(served or '')[:7]} on disk but its "
+                        f"process imported src/ at {loaded[:7]} and has not "
+                        f"restarted: {len(stale)} src/ file(s) changed since "
+                        f"then are NOT running ({', '.join(stale[:5])}). "
+                        f"Reboot the app from the Streamlit Cloud dashboard.",
+                        "INFRASTRUCTURE"))
+                if served is None:
+                    report["deploy_correspondence"] = "unverifiable"
+                    report["deploy_unverifiable_reason"] = why
+                    failures.append(classify(
+                        "Could not read the revision production is serving "
+                        f"({why}), so this run cannot confirm it tested "
+                        f"{EXPECTED_SHA[:7]} rather than the previous build.",
+                        "QA"))
+                elif EXPECTED_SHA.startswith(served.lower()[:7]):
+                    report["deploy_correspondence"] = "match"
+                elif _serves_expected(served):
+                    # A NEWER build that contains the triggering commit -- in
+                    # practice the automated data-sync commit that lands right
+                    # after a merge. It tests everything the trigger changed.
+                    report["deploy_correspondence"] = "match (newer build)"
+                else:
+                    report["deploy_correspondence"] = "mismatch"
+                    failures.append(classify(
+                        f"Tested build {served[:7]} but this run was triggered by "
+                        f"{EXPECTED_SHA[:7]}; Streamlit had not finished swapping "
+                        f"builds within {DEPLOY_WAIT_S}s. This result does not "
+                        f"describe the triggering commit.",
+                        "INFRASTRUCTURE"))
+
+            if state["state"] == "ready":
+                pass
+            elif state["state"] == "pipeline_running":
+                failures.append(classify(
+                    f"Application still executing its data pipeline after "
+                    f"{READY_BUDGET_S}s (spinner state). Python is running and the "
+                    f"websocket is up, so this is an application COLD-START "
+                    f"PERFORMANCE defect, not a QA timeout to be raised.",
+                    "APPLICATION"))
+            elif state["state"] in ("app_exception", "app_data_init_failed"):
+                failures.append(classify(
+                    f"Application reached a failed terminal state "
+                    f"'{state['state']}': {state.get('body_head', '')}", "APPLICATION"))
+            elif state["state"].startswith("cloud_"):
+                failures.append(classify(
+                    f"Never reached the application; Streamlit Cloud wrapper state "
+                    f"'{state['state']}': {state.get('body_head', '')}", "INFRASTRUCTURE"))
+            else:
+                failures.append(classify(
+                    f"Unclassified readiness state '{state['state']}': "
+                    f"{state.get('body_head', '')}", "QA"))
+
+            # Only exercise the UI against a genuinely ready warm session.
+            if state["state"] == "ready":
+                report["viewports"] = {}
+                for name, (w, h) in VIEWPORTS.items():
+                    page.set_viewport_size({"width": w, "height": h})
+                    page.wait_for_timeout(600)
+                    vp: dict = {"tabs": {}}
+                    frame = app_frame(page)
+                    # Progress, printed as it happens. The walk used to be
+                    # silent until the verdict, so a run that overran the
+                    # workflow timeout was killed having reported NOTHING about
+                    # where the time went -- which is exactly when you most
+                    # need to know. Under st.navigation each page change is a
+                    # server round trip rather than a CSS toggle, so this walk
+                    # is inherently slower and its cost has to be visible.
+                    _vp_started = time.perf_counter()
+                    print(f"[viewport] {name} ({w}x{h})", flush=True)
+                    if name not in FULL_WALK_VIEWPORTS:
+                        # Reachability, not re-rendering. `missing_pages` opens
+                        # the overflow dropdowns before concluding anything, so
+                        # a page collapsed into one counts as present.
+                        unreachable = missing_pages(frame, TABS, page)
+                        vp["pages_unreachable"] = unreachable
+                        if unreachable:
+                            failures.append(classify(
+                                f"{name}: pages unreachable from the navigation: "
+                                f"{unreachable}", "APPLICATION"))
+                        if frame.locator('[data-testid="stException"]').count():
+                            failures.append(classify(
+                                f"{name}: stException present", "APPLICATION"))
+                        print(f"    reachability     "
+                              f"{'ok' if not unreachable else unreachable}",
+                              flush=True)
+                        TABS_TO_WALK = []
+                    else:
+                        TABS_TO_WALK = TABS
+
+                    for tab in TABS_TO_WALK:
+                        _page_started = time.perf_counter()
+                        try:
+                            try:
+                                how = open_page(frame, tab, page)
+                            except LookupError as exc:
+                                vp["tabs"][tab] = "not_visible"
+                                failures.append(classify(
+                                    f"{name}: page '{tab}' unreachable: {exc}",
+                                    "APPLICATION"))
+                                continue
+                            vp.setdefault("nav_how", {})[tab] = how
+                            # Only the active page's script runs now, so the
+                            # body arrives after a server round trip rather than
+                            # being already in the DOM behind a CSS toggle.
+                            # Wait for the RUN to finish rather than a fixed
+                            # sleep: settle_after_nav returns as soon as the
+                            # spinner clears, which is usually far sooner than
+                            # any constant safe enough for the slowest page.
+                            settle_after_nav(page, frame)
+                            # Streamlit replaces the mounted app frame after a
+                            # page navigation. Reacquire it before reading the
+                            # new page; retaining the old Frame causes the
+                            # viewport-dependent "Frame was detached" failures
+                            # seen on the mobile full-walk.
+                            frame = app_frame(page)
+                            body = frame.locator("body").inner_text(timeout=10_000)
+                            hits = [t for t in RUNTIME_TOKENS if t in body]
+                            if frame.locator('[data-testid="stException"]').count():
+                                hits.append("stException")
+                            if hits:
+                                vp["tabs"][tab] = f"runtime_error:{hits}"
+                                failures.append(classify(
+                                    f"{name}/{tab}: runtime error tokens {hits}",
+                                    "APPLICATION"))
+                            else:
+                                vp["tabs"][tab] = "ok"
+                            print(f"    {tab:<16} {vp['tabs'][tab]:<10} "
+                                  f"via {how} "
+                                  f"({time.perf_counter() - _page_started:.1f}s)",
+                                  flush=True)
+                        except Exception as exc:
+                            vp["tabs"][tab] = f"error:{type(exc).__name__}"
+                            failures.append(classify(
+                                f"{name}/{tab}: {type(exc).__name__}: {exc}", "APPLICATION"))
+                    # The tab walk above only asks whether Configuration
+                    # renders without a traceback. The reported defect renders
+                    # perfectly -- it just shows the wrong numbers -- so read
+                    # the values themselves on the sizes that matter.
+                    if name in CONFIG_AUDIT_VIEWPORTS:
+                        try:
+                            open_page(frame, "Configuration", page)
+                            page.wait_for_timeout(1_800)
+                            frame = app_frame(page)
+                            ev = audit_configuration(page, frame)
+                            vp["configuration"] = ev
+                            failures.extend(judge_configuration(name, ev))
+                            page.screenshot(path=str(OUT / f"{name}_configuration.png"))
+                        except Exception as exc:
+                            vp["configuration"] = {"error": f"{type(exc).__name__}: {exc}"}
+                            failures.append(classify(
+                                f"{name}/Configuration audit: "
+                                f"{type(exc).__name__}: {exc}", "QA"))
+
+                    overflow = page.evaluate(
+                        "document.documentElement.scrollWidth - window.innerWidth")
+                    vp["h_overflow_px"] = overflow
+                    if w <= 600 and overflow > 24:
+                        failures.append(classify(
+                            f"{name}: horizontal overflow {overflow}px", "APPLICATION"))
+                    page.screenshot(path=str(OUT / f"{name}.png"))
+                    vp["elapsed_s"] = round(time.perf_counter() - _vp_started, 1)
+                    print(f"[viewport] {name} done in {vp['elapsed_s']}s",
+                          flush=True)
+                    report["viewports"][name] = vp
+                report["nav_styling"] = audit_nav_styling(app_frame(page))
+                if report["nav_styling"].get("css_applied") is False:
+                    failures.append(classify(
+                        f"The navigation stylesheet is not applying: "
+                        f"{report['nav_styling']}", "APPLICATION"))
+
+                # Before the deep-link forms, because this one needs the
+                # screener as the browser actually left it.
+                report["stock_link"] = audit_stock_link_navigation(page)
+                click = report["stock_link"].get("click") or {}
+                if click.get("reached_stock_page") and "stock=" not in str(click.get("to")):
+                    failures.append(classify(
+                        "A ticker click opened the stock page but the address "
+                        f"bar did not follow, so it cannot be refreshed or "
+                        f"shared: {click}", "APPLICATION"))
+
+                # Last, because each form is a full navigation away from the
+                # warm session the walk above depends on.
+                report["deep_links"] = audit_deep_links(page)
+                mounted = report["deep_links"].get("mounted_query", {})
+                if not mounted.get("reached_stock_page"):
+                    failures.append(classify(
+                        f"The app's own stock deep link did not open a stock "
+                        f"page: {mounted}", "APPLICATION"))
+        except Exception as exc:
+            failures.append(classify(
+                f"Browser session error: {type(exc).__name__}: {exc}", "QA"))
+        finally:
+            try:
+                (OUT / "final_dom.html").write_text(page.content(), encoding="utf-8")
+                page.screenshot(path=str(OUT / "final_state.png"))
+            except Exception:
+                pass
+            context.close()
+            browser.close()
+
+    report["websockets"] = ws_events
+    report["websocket_established"] = any("_stcore/stream" in e for e in ws_events)
+    report["console_errors"] = console_errors[:40]
+    report["page_errors"] = page_errors[:40]
+    report["server_errors_5xx"] = bad_responses[:40]
+    report["not_found_404"] = sorted(set(not_found))[:40]
+    report["timeline"] = timeline
+    report["failures"] = failures
+    report["failure_classes"] = sorted({f["kind"] for f in failures})
+
+    (OUT / "report.json").write_text(json.dumps(report, indent=2), encoding="utf-8")
+
+    print("\n================ PRODUCTION QA VERDICT ================", flush=True)
+    print(f"readiness state       : {report.get('ready_state')}", flush=True)
+    # Independent of the browser, so it still reports when the browser cannot
+    # run at all -- and it distinguishes "app is down" from "we could not look".
+    _ah = (report.get("http_probe") or {}).get("app_health") or {}
+    print(f"app process alive     : {bool(_ah.get('is_streamlit_health_ok'))} "
+          f"(HTTP {_ah.get('status', '-')} at /~/+/_stcore/health)", flush=True)
+    if EXPECTED_SHA and "deploy_correspondence" not in report:
+        print(f"deploy correspondence : not checked (app never reached ready; "
+              f"expected {EXPECTED_SHA[:7]})", flush=True)
+    elif EXPECTED_SHA:
+        reason = report.get("deploy_unverifiable_reason")
+        print(f"deploy correspondence : {report.get('deploy_correspondence')} "
+              f"(expected {report.get('expected_revision')}, "
+              f"served {report.get('served_revision')}"
+              + (f", {reason}" if reason else "") + ")", flush=True)
+        if report.get("loaded_revision"):
+            print(f"modules loaded at     : {report['loaded_revision']}"
+                  + (f"  STALE: {len(report['stale_modules'])} src/ file(s) not running"
+                     if report.get("stale_modules") else ""), flush=True)
+    print(f"time to that state    : {report.get('ready_after_s')}s", flush=True)
+    if "data_source" in report:
+        print(f"data loaded from      : {report['data_source'] or 'not shown'}", flush=True)
+    print(f"websocket established : {report['websocket_established']}", flush=True)
+    print(f"page errors           : {len(page_errors)}", flush=True)
+    print(f"console errors        : {len(console_errors)}", flush=True)
+    for c in console_errors[:5]:
+        print(f"    {c}", flush=True)
+    if report["not_found_404"]:
+        print(f"404 subresources      : {len(not_found)} "
+              f"({len(report['not_found_404'])} distinct)", flush=True)
+        for u in report["not_found_404"][:10]:
+            print(f"    {u}", flush=True)
+    if timeline:
+        print(f"frames at last sample : {timeline[-1].get('frames')}", flush=True)
+    if report.get("stock_link"):
+        print(f"stock link shape      : "
+              f"{report['stock_link'].get('frame_shape')}", flush=True)
+        if report["stock_link"].get("link_found"):
+            print(f"stock link element    : "
+                  f"{report['stock_link']['link_found']}", flush=True)
+        print(f"stock link click      : "
+              f"{report['stock_link'].get('click')} "
+              f"(via {report['stock_link'].get('clicked_via')})", flush=True)
+    if report.get("nav_styling"):
+        print(f"nav styling           : {report['nav_styling']}", flush=True)
+    for _label, _info in (report.get("deep_links") or {}).items():
+        print(f"deep link [{_label:<14}] {_info}", flush=True)
+    for _vn, _vd in (report.get("viewports") or {}).items():
+        _cfg = _vd.get("configuration")
+        if not _cfg:
+            continue
+        print(f"config panel [{_vn}]", flush=True)
+        if _cfg.get("error"):
+            print(f"    error             : {_cfg['error']}", flush=True)
+        if _cfg.get("build_chip") is not None:
+            print(f"    build chip        : {_cfg['build_chip']}", flush=True)
+        if _cfg.get("streamlit_version") is not None:
+            print(f"    streamlit         : {_cfg['streamlit_version']}", flush=True)
+        if _cfg.get("nav_trace"):
+            print(f"    nav               : {'; '.join(_cfg['nav_trace'])}", flush=True)
+        for _phase in ("initial", "after_nav", "after_reset"):
+            _snap = _cfg.get(_phase)
+            if _snap:
+                print(f"    {_phase:<17} : weights={_snap.get('weights')} "
+                      f"pill={_snap.get('pill')}", flush=True)
+        if _cfg.get("after_reset_error"):
+            print(f"    reset             : {_cfg['after_reset_error']}", flush=True)
+        if _cfg.get("first_weight_slider_html"):
+            print(f"    1M markup         : {_cfg['first_weight_slider_html']}",
+                  flush=True)
+    print(f"5xx responses         : {len(bad_responses)}", flush=True)
+    for f in failures:
+        print(f"  [{f['kind']}] {f['detail']}", flush=True)
+    if not failures:
+        print("  no failures", flush=True)
+    print("======================================================", flush=True)
+
+    if failures:
+        raise SystemExit(1)
+
+
+if __name__ == "__main__":
+    main()

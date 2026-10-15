@@ -1,0 +1,107 @@
+# Data catalogue
+
+One page that says what data exists, where it lives, who writes it and who
+reads it. Detail lives in the linked docs; this page is the index.
+
+Times are UTC. R2 is Cloudflare R2 (the research archive, immutable
+content-addressed revisions plus a `current` pointer per dataset). `data/` is
+the repo copy the app reads at run time.
+
+## R2 datasets
+
+| Dataset (R2 prefix) | What it is | Grain | History | Writer (workflow, UTC) | Readers | Retention |
+|---|---|---|---|---|---|---|
+| `prices/screener` | Screener.in adjusted daily closes, ~1,167 stocks | stock × day | 10 years (bootstrap) | `screener_sync` 18:45 daily; `weekly_full_sync` Fri 18:30 | App price loader, backtests | Full history |
+| `prices/yahoo` | **Retired 2026-10-02**: no longer published; Yahoo files live on the `data-latest` release only | — | — | — | — | Deleted whole by `r2_retention` |
+| `prices/yahoo/raw`, `prices/yahoo/bootstrap` | **Retired** (Yahoo data removed from R2) | — | — | — | — | Deleted whole |
+| `prices/screener/bootstrap` | Bootstrap load | file | as pulled | `screener_10y_bootstrap` | Rebuilds, audits | Never touched |
+| `nse/prices_daily` | NSE bhav copy, unadjusted OHLC (index closes on bundle days), ~3,800 securities | security × day | **10 Jun 2010 to date** (Jan–Jun 2010 being collected) | `nse_collect` every 4 h; `daily_sync` collects the last 3 sessions; history imported 2 Oct 2026 from NSE's full bhavcopy via the GitHub mirror (`nse_history_import`) | NSE adjustment layer, three-source check, source checks | Full history |
+| `nse/corporate_actions` | NSE Bc file: splits, bonuses, rights, demergers parsed to kind and price factor | action, per listing day | Oct 2023 to date | `nse_collect` | `src/loaders/nse_adjusted.py`, `src/engine/reconcile.py` | Full history |
+| `nse/corporate_actions_history` | NSE's corporate-action list, with face values | action, one file per ex-date year | 2008 – 2026 | `nse_history_import`, monthly on the 2nd 21:13 UTC: last year and this year (one request a year per board); by hand for earlier years | `nse_history.read_r2` (with the daily files) | Full history |
+| `nse/closed_days` | Weekdays with no NSE bundle a week later (holidays) | day | grows | `nse_collect` | `nse_collect` (asks each once) | Full history |
+| `reference/*` (yahoo_close, eod2_close, tijori_close_verified, tijori_close_raw, marketlens_close, tejhq_adjusted_close, ss_close) | Independent price histories the long NSE file is audited against | stock x day | 1995 / 2002 / 2007 / 2010 to Oct 2026 by source | `r2_publish_release_asset` (by hand, 3 Oct 2026) | `scripts/audit_long_prices.py` | **Protected** (`PROTECTED_DATASETS`) |
+| `scratch/bse_bhavcopy_2026-10-03/` (raw tars, `bse_daily.parquet`, gap CSV, `MANIFEST.json`; **to be deleted** once NSE and BSE are aligned) | BSE bhavcopy, every equity, 2008-01-01 to date: OHLC, previous close, trades, shares, value; ISIN from 2024 only; 20 sessions Jun 2008 - Jan 2010 missing | security x day | 2008 - 2026 | `bse_bhavcopy_r2` (manual) | `scripts/audit_gaps_against_bse.py` | Scratch: outside every dataset `r2_retention.py` lists; delete by hand |
+| `prices/screener/max_history` | Screener's full chart history, weekly before the latest year, 1,345 stocks | stock x week | 2000 to Oct 2026 | `r2_publish_release_asset` (3 Oct 2026) | the audit | **Protected** |
+| `prices/ss` | The SS store: daily OHLCV, 1,216 stocks, 1,000 sessions each, one whole-history file | stock × day | from 2018 (most from Sep 2022) | `ss_sync` weekdays 22:02 IST | Three-source check; to become the app's primary source | 7 dates + month-ends |
+| `nse/market_caps` | NSE market cap per security | security × day | 3 years | `nse_collect` | Nano Cap list, screener MCAP column | Full history |
+| `nse/source_checks` | Disagreements between NSE and the other sources, newest day | check | newest day | `nse_compare`, `nse_sample_check` | Data-health review | Overwritten daily |
+| `market_caps/nse_history` | Market-cap history used for universe cuts | security × day | grows daily | `r2_market_cap_history` 20:00 | Membership, Nano Cap | Full history |
+| `indices/membership/nifty_total_market` | Point-in-time index membership | stock × effective date | from notices | `daily_sync`, membership notices | Backtester (`former_members`), Track Record | Full history |
+| `indices/prices/research` | Index levels (Nifty 500, Nifty 50 …) | index × day | years | `r2_nse_index_prices` 20:30 | Benchmarks, RRG, Breadth | Full history |
+| `trading_sessions/observed` | Sessions that actually traded | day | grows daily | `r2_observed_trading_sessions` | Continuity audit | Full history |
+| `snapshots/rankings` | Daily ranking table (the rank history) | stock × day | grows daily | `r2_ranking_archive` 20:45 | Rank history, Track Record "Ranks by month" | Full history |
+| `app/prices_snapshot`, `app/prices_extra` | **Retired 2026-10-02**: app reads these from the release only | — | — | — | — | Deleted whole |
+| `snapshots/application` | Retired. No longer published (2026-09-25) | | | | | Existing copies follow the 7 + month-end rule |
+
+Policy and recovery: `docs/R2_RECOVERY_AND_RETENTION.md`. Layout and rules
+(never splice sources, preserve departed stocks, manifests, checksums):
+`docs/MARKET_DATA_ARCHIVE_R2_SPEC.md`.
+
+## Repo files the app reads (`data/`)
+
+| File | What it is | Written by |
+|---|---|---|
+| `indices/ind_*.csv` | Current NSE index constituent lists (Total Market, Nifty 50, Next 50, Midcap 150, Smallcap 250, Microcap 250, Nano Cap) | `daily_sync` |
+| `membership_history.json`, `membership_notices.json` | Point-in-time membership and the notices it is built from | membership scripts (`docs/MEMBERSHIP_FROM_NOTICES.md`) |
+| `membership_history.json` (extended) | Seven indices from 2010, the ticker-change ledger (`symbol_changes`), caveats, applied rules | `nse_index_rebuild/merge_into_history.py`; the daily sync still appends changes |
+| `membership_history.freeze.json` | SHA-256 of the history through 2026-09-30 and its change log | `nse_index_rebuild/freeze_history.py` (checked in CI) |
+| `reference/nse/*` | Daily copy of NSE's ticker-change, name-change, listed-equities and corporate-action feeds, `MANIFEST.json`, `CHANGES.json`, `anchor_checks.jsonl` (today's lists on two NSE hosts against the history) | `nse_reference_sync` (`scripts/sync_nse_reference.py`, `scripts/check_index_anchor.py`) |
+| `reference/nse/isin_history.csv` | ISIN history used to follow renames in prices | `scripts/build_isin_history.py` |
+| `nse_prices/notes.json` corrections | 19 hand corrections for actions in no list (2008-09 splits, rights and schemes of index stocks), each with its evidence; skipped when an action covers the day | owner and the long-price audit |
+| release `nse_long_close/value.parquet`, `nse_long_report.json` | The 2008+ NSE price file for "History from 2010" backtests: 1,418 series, every equity series, adjusted | `nse_long_prices` (Saturdays; every session re-read on the second Saturday) |
+| `nanocap_membership.json` | Month-end Nano Cap list | `daily_sync` (builds on the last session of the month) |
+| `corporate_actions_log.json` | Corporate actions applied | `daily_sync` |
+| `former_member_prices.parquet/.json` | Prices for stocks that left the universe, so past months replay faithfully | `daily_sync` |
+| `nse_prices/closes.parquet`, `actions.parquet`, `notes.json` | Local NSE close and action copies (2 years) for the adjustment layer; `notes.json` holds one-off corrections and rename overrides | `sync_nse_prices` (monthly) |
+| `benchmarks.csv` | Nifty 500 and Nifty 50 daily closes from 7 Jun 1999 (NSE rows win, then SS, then the Kaggle NSE dataset's index files, then Screener) | `daily_sync` (`build_benchmarks.py --update`); Kaggle rows once (#344) |
+| `reference/nse/holidays.csv`, `special_sessions.csv` | NSE's published trading holidays (its holiday-master API) and the weekend sessions it announced (Muhurat, Budget days, special Saturdays), for the calendar check `src/loaders/nse_calendar.py` | by hand / audit (3 Oct 2026); also the Actions session count (`nse_calendar.published_holidays`) |
+| `src/engine/parity_accepted_drift.json` (code, not `data/`) | Frozen track-record months whose drift against the replay the owner accepted: stored value, accepted replay, reason, decision (Jan and Feb 2026) | By hand, with the owner's decision; read by `scripts/canonical_parity_check.py` and `update_track_record.py` |
+| `reference/historical_industries.csv` | NSE's four-level classification for the 217 index members no current list labels (mostly gone before 2021), each web-checked, with source | 3 Oct 2026 (#346) |
+| Release `nse_long_close.parquet`, `nse_long_value.parquet`, `nse_long_report.json` | The long NSE price file, 2008 to date: adjusted closes and traded value (Rs Cr) for every stock any index ever listed; the Backtest page's "History from 2010". NSE-only gaps filled from BSE's raw closes (S38, `bse_fill_*.csv` in the audit zip) | `nse_long_prices.yml` weekly, Saturdays 03:30 UTC; the second Saturday of each month (the 8th - 14th) re-reads every session and action day from R2, ignoring the packs (S47) (`scripts/build_nse_long_prices.py`; ~2.5 min since S54) |
+| Release `nse_raw_pack.parquet`, `nse_actions_pack.parquet` | What the last long-file build read from R2: NSE's raw rows (170 MB) and the daily corporate-action rows, each tagged with its R2 day (~4 MB). The next build reads only the sessions and action days these lack (plus the newest 10 action days); `full=yes`, and the second Saturday's scheduled build each month, read everything again. Never replaced by a smaller pack (`check_long_publish.py`) | `nse_long_prices.yml` |
+| Release `bse_daily.parquet`; R2 `bse/daily` (protected) | BSE's bhavcopy for every equity, 2008 to date (15.4M rows, 4,628 sessions on 7 Oct 2026): close, shares, ISIN (from Jul 2024). Read by the long-file build to fill NSE-only gaps | `bse_daily.yml`, Fridays 20:30 UTC (only new sessions; R2 copy monthly) |
+| `reference/weekly_fill_extra.parquet` | Daily closes, Oct 2024 - Sep 2025, for the seven stocks NSE's committed file lacks over Screener's weekly stretch (BIRET, EMBASSY, JSLL from the long file; SGMART, SHILCTECH, TIMEX, PICCADIL from BSE, SHILCTECH's 1:2 bonus applied) | `scripts/build_weekly_fill_extra.py`, once (history) |
+| `reference/weekly_fill_nano.parquet` | NSE-adjusted daily closes from 1 Oct 2024 for every stock a Nano Cap list has held (less today's 750), BSE before a stock listed on NSE; fills Nano Cap / Combined over Screener's weekly stretch (S57) | `scripts/build_weekly_fill_extra.py --nano`; the daily sync rebuilds it only when a list member is missing |
+| `reference/nse/symbolchange.csv`, `namechange.csv`, `equity_l.csv` | NSE's ticker changes (1999 on), name changes and today's listed equities with ISINs | `sync_nse_reference` daily |
+| `reference/nse/isin_history.csv` | Every symbol–ISIN pair in NSE's bhavcopy, Jun 2011 – Jun 2021, first and last day | `build_isin_history.py`, once (history) |
+| `nse_market_caps.csv`, `nse_all_time_highs.csv`, `nse_tv_classification.csv`, `nse_fo_symbols.json`, `nse_trading_days.json`, `screener_company_ids.json` | Reference tables: market cap, all-time highs, industry labels, F&O list, trading calendar, Screener ids | `daily_sync` / collectors |
+| `track_record.json` | The frozen monthly Track Record ledger | `monthly_track_record`, 1st–5th of the month, 19:00 |
+
+## Which source wins
+
+**Today the app ranks on Screener, then NSE** for what Screener lacks
+(`price_source.ranking_frames`); for the 750, Screener's weekly stretch is
+filled with NSE's daily moves on Screener's level (7 Oct 2026; no dataset
+changes, the frame is built at run time from `prices/screener` and the
+committed `data/nse_prices`). Yahoo is no longer a source (owner, 2 Oct
+2026), and since 13 Oct 2026 no code downloads from it: `yfinance` is gone
+from `requirements.txt` (TODO S10). Yahoo survives only as the stored audit
+reference `reference/yahoo_close`. SS is collected nightly and checked against the other two by the
+three-source vote, with NSE's own record as judge; it is not yet wired into
+the app. Rules, the nightly run and the vote: `docs/PRICE_PIPELINE.md`.
+
+## Comparisons: where they stand
+
+- 2026-09-25: NSE vs Screener closes agree for 749 of 750; NSE vs Yahoo moves
+  agree for all 750. The one flag is HEG (demerger 2026-09-07, no price on
+  either).
+- Adjusted NSE vs Screener (third report): drift beyond 1% fell from 135 stocks
+  to 58 after applying splits and bonuses; rank correlation 0.9993 / 0.9934 /
+  0.9975, top-20 overlap 20/20, 19/20, 20/20.
+- Fourth report (27 Sep): 1,117 of 1,167 stocks within 1% throughout, 50
+  beyond; rank correlation 0.9997 / 0.9984 / 0.9991, top 20 in common 20/20,
+  19/20, 20/20, top 50 50/50.
+- Decision (owner, 2 Oct 2026): NSE becomes the middle source, skipping the
+  ~50 stocks still beyond 1%. Wired in 2 Oct: gaps in Screener fill from NSE.
+- SS vs Screener (2 Oct, a year of 192 stocks): identical to the paisa on 187;
+  differences were a rights issue (ADANIENT), an SME migration (ADVAIT), a new
+  listing (ARCIL) and one day (BLISSGVS). Screener's volume is NSE + BSE.
+- Three-source vote (Aug–Sep 2026, 1,210 stocks, NSE for 1,207): SS outvoted 52
+  times, Screener 18, 1 unresolved (HEG's demerger day). See
+  `docs/PRICE_PIPELINE.md`.
+
+## Freshness in the app
+
+The header pill shows the price date. Configuration → Universe has a table of
+every source's latest date, how many trading days behind it is, and whether it
+is current, plus the manual refresh (one global refresh per cooldown).

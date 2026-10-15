@@ -1,0 +1,41 @@
+# Pinned, not floated. `streamlit>=1.35.0` let Streamlit Cloud install a
+# different FRONTEND on any reboot with no commit in this repository, and the
+# frontend is where the Configuration sliders rendered at their minimum.
+# Production confirmed 1.63.0 is what this deployment already resolves to, so
+# this pin changes nothing today and stops the next silent swap. To upgrade:
+# bump here, let V1 Production QA verify against the live app, then keep it.
+streamlit==1.65.0
+# The numeric stack and the data clients are pinned for the same reason as
+# streamlit: a floor like `pandas>=2.0.0` let every container boot pick up
+# whatever was newest that day, while CI had only ever tested one version.
+# These are the versions the full suite passed on (2026-09-25). pandas 3 and
+# numpy 2 change dtype and copy semantics the engine depends on, and a floor
+# of 2.0.0 / 1.24.0 claimed support for versions nothing ever ran. Dependabot
+# (monthly, increase-if-necessary) opens a PR for each new release; bump
+# deliberately and let CI plus V1 Production QA confirm it.
+pandas==3.0.6
+numpy==2.4.6
+# scikit-learn was declared here and imported NOWHERE -- `grep -rn sklearn`
+# across the repository returns this line and nothing else. Carrying it cost
+# the cold start a ~30 MB wheel plus joblib and threadpoolctl on every container
+# boot, for nothing. scipy went the same way on
+# 2026-09-25: its only user was an Equal Risk Contribution optimiser nothing
+# in the app could reach.
+requests==2.34.2
+# Pinned to the exact version, not capped below a range.
+#
+# pyarrow 25.0.1 segfaults (apache/arrow#50471) and Streamlit Cloud knows it:
+# every boot it detected 25.0.1, uninstalled it and installed 24.0.0 itself,
+# so the float was buying no newer version anyway -- only an uninstall and a
+# reinstall on the critical path of every cold start.
+#
+# `pyarrow<25` would have been a permanent ceiling for a temporary bug, and
+# nothing would ever have prompted a re-look. An exact pin is a line with a
+# reason and a way out: when arrow#50471 closes, bump this deliberately and
+# let the QA run confirm it.
+pyarrow==24.0.0
+# S3-compatible Cloudflare R2 archive adapter. Left as a range on purpose:
+# boto3 releases almost daily, its S3 API is stable within a major, and the
+# R2 read-path gate re-runs on main whenever this file changes.
+boto3>=1.35.0,<2
+streamlit-lightweight-charts==0.7.20

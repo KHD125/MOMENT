@@ -1,0 +1,41 @@
+{
+ "closed_days": [
+  "2026-01-15",
+  "2026-05-01",
+  "2026-05-28",
+  "2026-06-26",
+  "2026-09-14"
+ ],
+ "closed_days_source": {
+  "2026-01-15": "zero-volume evidence (89% priced, all flat at zero volume)",
+  "2026-05-01": "zero-volume evidence (89% priced, all flat at zero volume)",
+  "2026-05-28": "zero-volume evidence (100% priced, all flat at zero volume)",
+  "2026-06-26": "zero-volume evidence (100% priced, all flat at zero volume)",
+  "2026-09-14": "user-confirmed NSE holiday (2026-09-17)"
+ },
+ "note": "trading_days holds CONFIRMATIONS only: an absent date is unknown, never closed, because NSE answers 403 when rate limiting and that cannot be told from any other refusal. closed_days is the opposite claim and needs its own evidence; closed_days_source records it.",
+ "schema_version": 1,
+ "source": "NSE PR bhavcopy (archives.nseindia.com) \u2014 HTTP 200 only",
+ "trading_days": [
+  "2026-09-11",
+  "2026-09-15",
+  "2026-09-16",
+  "2026-09-17",
+  "2026-09-18",
+  "2026-09-21",
+  "2026-09-22",
+  "2026-09-23",
+  "2026-09-24",
+  "2026-09-25",
+  "2026-09-28",
+  "2026-09-29",
+  "2026-09-30",
+  "2026-10-01",
+  "2026-10-05",
+  "2026-10-06",
+  "2026-10-07",
+  "2026-10-08",
+  "2026-10-09",
+  "2026-10-12"
+ ]
+}

@@ -1,0 +1,217 @@
+"""The stock detail page, and getting to it from the screener.
+
+Two defects motivated this. The card grid rendered view.head(48) and stopped
+SILENTLY -- ranks 49 to 750 did not exist in card view and nothing on screen
+said so. And there was no way to open a stock at all except by typing it into
+the search box; clicking a symbol did nothing.
+"""
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+import pytest
+
+from streamlit.testing.v1 import AppTest
+
+APP = str(Path(__file__).parent / "_stock_page_probe_app.py")
+
+
+def _app(**query):
+    at = AppTest.from_file(APP, default_timeout=180)
+    for k, v in query.items():
+        at.query_params[k] = v
+    at.run()
+    return at
+
+
+# ── Routing ─────────────────────────────────────────────────────────────────
+
+def test_screener_renders_without_a_stock_param():
+    at = _app()
+    assert not at.exception
+
+
+def test_stock_param_opens_the_detail_page():
+    at = _app(stock="S3")
+    assert not at.exception
+    body = " ".join(m.value for m in at.markdown)
+    assert "S3" in body
+
+
+@pytest.mark.parametrize("section", [
+    "Momentum rank", "Screener filters", "Price and relative strength",
+    "Where the price sits", "Returns and risk by window",
+])
+def test_every_section_of_the_page_renders(section):
+    at = _app(stock="S3")
+    body = " ".join(m.value for m in at.markdown)
+    assert section in body
+
+
+def test_the_page_offers_a_way_back():
+    at = _app(stock="S3")
+    assert any("Back to screener" in b.label for b in at.button)
+
+
+def test_symbol_lookup_is_case_insensitive():
+    at = _app(stock="s3")
+    assert not at.exception
+    assert "S3" in " ".join(m.value for m in at.markdown)
+
+
+def test_an_unknown_symbol_warns_rather_than_crashing():
+    at = _app(stock="NOSUCHTICKER")
+    assert not at.exception
+    assert any("not in the current ranking" in w.value for w in at.warning)
+
+
+def test_the_ladder_shows_the_all_time_high():
+    at = _app(stock="S3")
+    body = " ".join(m.value for m in at.markdown)
+    assert "All-time high" in body
+    assert "52W high" in body  # label style: owner, 12 Oct 2026
+
+
+def test_returns_and_risk_cover_every_window():
+    at = _app(stock="S3")
+    body = " ".join(m.value for m in at.markdown)
+    for months in (1, 3, 6, 9, 12):
+        assert f"<b>{months}M</b>" in body
+    for band in ("Return", "Sharpe", "Max drawdown"):
+        assert band in body
+
+
+def test_the_page_carries_its_data_checks():
+    at = _app(stock="S3")
+    # An expander with an icon reaches AppTest as a status block.
+    labels = [str(getattr(e, "label", "")) for e in list(at.expander) + list(at.status)]
+    assert any(label.startswith("Data checks") for label in labels), labels
+
+
+# ── Navigation links ────────────────────────────────────────────────────────
+
+def _rank_df(cols: int = 8):
+    from src.engine.momentum import MomentumEngine
+
+    n = 400
+    idx = pd.bdate_range(end="2026-08-18", periods=n)
+    rng = np.random.default_rng(4)
+    px = pd.DataFrame(
+        100 * np.exp(np.cumsum(rng.normal(0.0004, 0.012, (n, cols)), axis=0)),
+        index=idx, columns=[f"S{i}" for i in range(cols)],
+    )
+    info = pd.DataFrame({
+        "Symbol": [f"S{i}" for i in range(cols)],
+        "Industry": ["IT", "Bank"] * (cols // 2),
+        "Indices": ["NIFTY 50"] * cols,
+    })
+    calc = MomentumEngine(px, high_df=px * 1.01, low_df=px * 0.99, close_df=px,
+                          volume_df=pd.DataFrame(1e5, index=idx, columns=px.columns))
+    return calc.get_rankings(info, pd.Series(1e4, index=px.columns),
+                             close_prices_df=px, high_prices_df=px * 1.01), px
+
+
+def test_screener_row_links_to_the_stock_page():
+    from src.ui import screener_table
+
+    rank_df, px = _rank_df()
+    html = screener_table.table_html(rank_df, px, "Core (17)")
+    sym = rank_df.iloc[0]["Symbol"]
+    assert f'href="?stock={sym}"' in html
+    assert f'<tr data-stock="{sym}">' in html
+
+
+def test_screener_table_opens_stocks_through_the_host_like_the_wide_table():
+    """Same sandbox, same working mechanism as the Full Quant table below."""
+    from src.ui import screener_table
+
+    rank_df, px = _rank_df()
+    html = screener_table.table_html(rank_df, px, "Executive (11)")
+    assert "host.document.createElement('script')" in html
+    assert "host.document.body.appendChild(s)" in html
+    assert "window.location.search='+JSON.stringify(search)" in html
+    assert "window.open(search,'_blank')" in html
+    assert 'target="_parent"' not in html
+
+
+def test_screener_table_holds_every_row_and_shows_about_25():
+    """Sorting must see all rows; the frame shows ~25 before scrolling."""
+    from src.ui import screener_table
+
+    rank_df, px = _rank_df(cols=40)
+    captured = {}
+    orig = screener_table.st.iframe
+    screener_table.st.iframe = lambda h, **k: captured.update(html=h, **k)
+    try:
+        screener_table.render_screener_table(rank_df, px, "Core (17)")
+    finally:
+        screener_table.st.iframe = orig
+    assert captured["html"].count("<tr data-stock=") == len(rank_df)
+    shown = (captured["height"] - 48) / screener_table.ROW_PX
+    assert shown >= 25 or len(rank_df) < 25
+
+
+def test_table_symbol_opens_the_stock_page_by_injecting_into_the_host():
+    """The table lives in a sandboxed iframe, and the sandbox decides this.
+
+    Streamlit mounts it with
+
+        allow-forms allow-modals allow-popups allow-popups-to-escape-sandbox
+        allow-same-origin allow-scripts allow-downloads
+
+    and no allow-top-navigation. Two mechanisms were tried against a real
+    browser before this one and BOTH failed: target="_parent" was dropped
+    silently, and assigning parent.location raised "The current window does not
+    have permission to navigate the target frame". A unit test asserting either
+    of them passed anyway, which is why this one names the working mechanism.
+
+    What is allowed is same-origin access. The frame adds a script to the parent
+    document; that script runs as the parent, which is not sandboxed, and a page
+    navigating itself is never blocked.
+    """
+    from src.ui import screener_table
+
+    rank_df, px = _rank_df()
+    html = screener_table.table_html(rank_df, px, "Full Quant (35)")
+    # A real href survives for middle-click and "copy link address"...
+    assert 'href="?stock=' in html
+    # ...and the symbol carries the payload the delegated handler reads.
+    assert 'data-stock="' in html
+    # The handler builds a script IN THE PARENT DOCUMENT and appends it there.
+    assert "window.parent" in html
+    assert "host.document.createElement('script')" in html
+    assert "host.document.body.appendChild(s)" in html
+    assert "window.location.search='+JSON.stringify(search)" in html
+    # A cross-origin parent would throw; allow-popups still gets the user there.
+    assert "window.open(search,'_blank')" in html
+    # Every mechanism a browser refused must stay gone.
+    assert 'target="_parent"' not in html
+    assert 'target="_self"' not in html
+    assert "searchParams.set('stock'" not in html
+    assert "p.location.href" not in html
+
+
+def test_the_table_view_has_no_redundant_stock_picker():
+    """The picker was a fallback for a link that did not work.
+
+    Verified in a browser that clicking a symbol in table view now opens the
+    stock page, so the picker only cost vertical space above the table -- which
+    is exactly what is scarce on a phone.
+    """
+    import inspect
+
+    from src.ui.views import ranking_view
+
+    src = inspect.getsource(ranking_view.render_ranking_view)
+    assert "rank_open_stock" not in src
+
+
+# ── Card grid reaches every stock ───────────────────────────────────────────
+
+def test_empty_result_says_so(monkeypatch):
+    from src.ui import screener_table
+
+    infos = []
+    monkeypatch.setattr(screener_table.st, "info", lambda t, **k: infos.append(t))
+    screener_table.render_screener_table(pd.DataFrame(columns=["Symbol", "Rank"]), None, "Core (17)")
+    assert infos and "No stocks match" in infos[0]

@@ -1,0 +1,626 @@
+"""A track record that changes when you change your mind is not a record.
+
+The backtest recomputes from live prices every run, so a vendor price revision,
+a universe change or a nudged slider silently rewrites what "January" returned.
+The ledger exists to stop that: a closed month is written once and frozen. These
+tests are the guarantee.
+"""
+
+import numpy as np
+import pandas as pd
+import pytest
+
+import src.engine.track_record as track_record
+
+from src.engine.track_record import (
+    INCEPTION,
+    TRACK_RECORD_CONFIG,
+    build_grid,
+    calendar_month_returns,
+    compound,
+    config_fingerprint,
+    drift_report,
+    empty_ledger,
+    finalize_months,
+    load_ledger,
+    months_to_cover,
+    save_ledger,
+    summary_stats,
+)
+
+
+def _curve(monthly: dict[str, float], start="2025-12-31") -> pd.Series:
+    """Daily curve whose calendar-month returns are exactly `monthly`."""
+    idx = pd.bdate_range(start=start, end="2026-12-31")
+    s = pd.Series(1.0, index=idx, dtype=float)
+    level = 1.0
+    for d in idx:
+        p = str(d.to_period("M"))
+        s.loc[d] = level
+    # Walk month by month, setting the month-end level.
+    for period_str, ret in monthly.items():
+        p = pd.Period(period_str, freq="M")
+        mask = idx.to_period("M") == p
+        if not mask.any():
+            continue
+        level = level * (1 + ret)
+        s.loc[idx[mask][-1]] = level
+        later = idx > idx[mask][-1]
+        s.loc[later] = level
+    return s
+
+
+def _flat(value=1.0):
+    idx = pd.bdate_range(start="2025-12-31", end="2026-12-31")
+    return pd.Series(value, index=idx, dtype=float)
+
+
+# ── Immutability: the whole point ────────────────────────────────────────────
+
+def test_a_frozen_month_is_never_rewritten_even_when_the_curve_changes():
+    """Re-running with DIFFERENT numbers must not move a stored month."""
+    first = _curve({"2026-01": 0.10, "2026-02": 0.05})
+    led, added, _ = finalize_months(
+        empty_ledger(), first, _flat(), "cfg1", as_of=pd.Timestamp("2026-03-15")
+    )
+    assert added == ["2026-01", "2026-02"]
+    stored_jan = led["months"]["2026-01"]["strategy"]
+
+    # The universe changed, prices were revised -- January now recomputes very
+    # differently. The record must not care.
+    second = _curve({"2026-01": -0.40, "2026-02": 0.99})
+    led2, added2, skipped2 = finalize_months(
+        led, second, _flat(), "cfg1", as_of=pd.Timestamp("2026-03-15")
+    )
+    assert added2 == []
+    assert set(skipped2) == {"2026-01", "2026-02"}
+    assert led2["months"]["2026-01"]["strategy"] == stored_jan
+    assert led2["months"]["2026-01"]["strategy"] == pytest.approx(0.10, abs=1e-6)
+
+
+def test_rerunning_is_idempotent():
+    curve = _curve({"2026-01": 0.10, "2026-02": 0.05})
+    led = empty_ledger()
+    for _ in range(4):
+        led, _, _ = finalize_months(
+            led, curve, _flat(), "cfg1", as_of=pd.Timestamp("2026-03-15")
+        )
+    assert len(led["months"]) == 2
+
+
+def test_a_new_month_appends_without_touching_the_old_ones():
+    led, _, _ = finalize_months(
+        empty_ledger(), _curve({"2026-01": 0.10}), _flat(), "cfg1",
+        as_of=pd.Timestamp("2026-02-15"),
+    )
+    frozen_jan = dict(led["months"]["2026-01"])
+
+    led, added, _ = finalize_months(
+        led, _curve({"2026-01": 0.10, "2026-02": 0.07}), _flat(), "cfg1",
+        as_of=pd.Timestamp("2026-03-15"),
+    )
+    assert added == ["2026-02"]
+    assert led["months"]["2026-01"] == frozen_jan
+
+
+def test_a_config_change_does_not_rewrite_history():
+    """New settings mark new months. Old months keep their old fingerprint."""
+    led, _, _ = finalize_months(
+        empty_ledger(), _curve({"2026-01": 0.10}), _flat(), "cfg_old",
+        as_of=pd.Timestamp("2026-02-15"),
+    )
+    led, added, _ = finalize_months(
+        led, _curve({"2026-01": 0.10, "2026-02": 0.07}), _flat(), "cfg_new",
+        as_of=pd.Timestamp("2026-03-15"),
+    )
+    assert led["months"]["2026-01"]["config"] == "cfg_old"
+    assert led["months"]["2026-02"]["config"] == "cfg_new"
+    assert summary_stats(led)["configs"] == ["cfg_new", "cfg_old"]
+
+
+def test_force_is_the_only_way_to_rewrite():
+    led, _, _ = finalize_months(
+        empty_ledger(), _curve({"2026-01": 0.10}), _flat(), "cfg1",
+        as_of=pd.Timestamp("2026-02-15"),
+    )
+    led, added, _ = finalize_months(
+        led, _curve({"2026-01": -0.20}), _flat(), "cfg1",
+        as_of=pd.Timestamp("2026-02-15"), force=True,
+    )
+    assert added == ["2026-01"]
+    assert led["months"]["2026-01"]["strategy"] == pytest.approx(-0.20, abs=1e-6)
+
+
+# ── What may enter the record ────────────────────────────────────────────────
+
+def test_the_month_in_progress_is_never_frozen():
+    """MTD moves every session; freezing it would record a half month."""
+    led, added, _ = finalize_months(
+        empty_ledger(),
+        _curve({"2026-01": 0.10, "2026-02": 0.05, "2026-03": 0.02}),
+        _flat(), "cfg1", as_of=pd.Timestamp("2026-03-15"),
+    )
+    assert "2026-03" not in led["months"]
+    assert added == ["2026-01", "2026-02"]
+
+
+def test_pre_inception_months_are_refused():
+    """2025 is not this strategy's record, however much curve exists."""
+    curve = _curve({"2025-11": 0.30, "2025-12": 0.20, "2026-01": 0.10},
+                   start="2025-10-31")
+    led, added, _ = finalize_months(
+        empty_ledger(), curve, _flat(), "cfg1", as_of=pd.Timestamp("2026-02-15")
+    )
+    assert added == ["2026-01"]
+    assert all(pd.Period(k, freq="M") >= INCEPTION for k in led["months"])
+
+
+def test_benchmark_is_recorded_beside_every_month():
+    strat = _curve({"2026-01": 0.10})
+    bench = _curve({"2026-01": 0.04})
+    led, _, _ = finalize_months(
+        empty_ledger(), strat, bench, "cfg1", as_of=pd.Timestamp("2026-02-15")
+    )
+    e = led["months"]["2026-01"]
+    assert e["benchmark"] == pytest.approx(0.04, abs=1e-6)
+    assert e["alpha"] == pytest.approx(0.06, abs=1e-6)
+
+
+# ── Derivation ───────────────────────────────────────────────────────────────
+
+def test_calendar_month_returns_measure_whole_months():
+    curve = _curve({"2026-01": 0.10, "2026-02": -0.05})
+    rets = calendar_month_returns(curve)
+    assert rets.loc[pd.Period("2026-01", freq="M")] == pytest.approx(0.10, abs=1e-9)
+    assert rets.loc[pd.Period("2026-02", freq="M")] == pytest.approx(-0.05, abs=1e-9)
+
+
+def test_months_to_cover_reaches_back_to_inception():
+    assert months_to_cover(pd.Timestamp("2026-09-03")) == 8   # Jan..Aug
+    assert months_to_cover(pd.Timestamp("2026-02-01")) == 1   # Jan
+    assert months_to_cover(pd.Timestamp("2026-01-15")) == 0   # nothing closed
+
+
+def test_drift_is_reported_but_never_applied():
+    led, _, _ = finalize_months(
+        empty_ledger(), _curve({"2026-01": 0.10}), _flat(), "cfg1",
+        as_of=pd.Timestamp("2026-02-15"),
+    )
+    report = drift_report(led, _curve({"2026-01": 0.25}))
+    assert len(report) == 1
+    assert report[0]["month"] == "2026-01"
+    assert report[0]["stored"] == pytest.approx(0.10, abs=1e-6)
+    assert report[0]["recomputed"] == pytest.approx(0.25, abs=1e-6)
+    assert led["months"]["2026-01"]["strategy"] == pytest.approx(0.10, abs=1e-6)
+
+
+# ── Aggregation, against the reference tracker's conventions ─────────────────
+
+def _grid_ledger(vals: dict[int, float]) -> dict:
+    led = empty_ledger()
+    led["months"] = {
+        f"2026-{m:02d}": {"strategy": v, "benchmark": 0.0, "alpha": v}
+        for m, v in vals.items()
+    }
+    return led
+
+
+def test_quarters_are_calendar_quarters():
+    led = _grid_ledger({1: 0.10, 2: 0.10, 3: 0.10, 4: 0.05})
+    row = build_grid(led).iloc[0]
+    assert row["Q1"] == pytest.approx(1.1 ** 3 - 1, abs=1e-9)
+    assert row["Q2"] == pytest.approx(0.05, abs=1e-9)
+
+
+def test_cy_compounds_january_through_december():
+    led = _grid_ledger({1: 0.10, 2: -0.05, 12: 0.20})
+    row = build_grid(led).iloc[0]
+    assert row["CY RETURN"] == pytest.approx(1.10 * 0.95 * 1.20 - 1, abs=1e-9)
+
+
+def test_fy_runs_april_to_march_across_the_year_boundary():
+    led = empty_ledger()
+    led["months"] = {
+        "2026-04": {"strategy": 0.10, "benchmark": 0.0, "alpha": 0.10},
+        "2027-02": {"strategy": 0.20, "benchmark": 0.0, "alpha": 0.20},
+        "2027-05": {"strategy": 0.50, "benchmark": 0.0, "alpha": 0.50},
+    }
+    grid = build_grid(led).set_index("YEAR")
+    # FY2026 = Apr 2026 .. Mar 2027: picks up Apr-26 and Feb-27, not May-27.
+    assert grid.loc[2026, "FY RETURN"] == pytest.approx(1.10 * 1.20 - 1, abs=1e-9)
+    assert grid.loc[2027, "FY RETURN"] == pytest.approx(0.50, abs=1e-9)
+
+
+def test_reference_tracker_conventions_reproduce():
+    """The user's sheet: Q1 2%, Q2 39%, Q3 12%, FY 56% off its monthly row."""
+    led = _grid_ledger(
+        {1: -0.036, 2: 0.174, 3: -0.096, 4: 0.25, 5: 0.06,
+         6: 0.05, 7: 0.04, 8: 0.08, 9: 0.0}
+    )
+    row = build_grid(led).iloc[0]
+    assert round(row["Q1"] * 100) == 2
+    assert round(row["Q2"] * 100) == 39
+    assert round(row["Q3"] * 100) == 12
+    assert round(row["FY RETURN"] * 100) == 56
+
+
+def test_mtd_enters_the_grid_without_entering_the_ledger():
+    led = _grid_ledger({1: 0.10})
+    period = pd.Period("2026-02", freq="M")
+    grid = build_grid(led, mtd=(period, 0.03))
+    row = grid.iloc[0]
+    assert row["FEB"] == pytest.approx(0.03, abs=1e-9)
+    assert row["Q1"] == pytest.approx(1.10 * 1.03 - 1, abs=1e-9)
+    assert "2026-02" not in led["months"], "the ledger itself stays frozen"
+
+
+def test_compound_of_nothing_is_none():
+    assert compound([]) is None
+    assert compound([float("nan")]) is None
+
+
+# ── Persistence ──────────────────────────────────────────────────────────────
+
+def test_round_trip_through_disk(tmp_path):
+    led, _, _ = finalize_months(
+        empty_ledger(), _curve({"2026-01": 0.10, "2026-02": 0.05}), _flat(),
+        "cfg1", as_of=pd.Timestamp("2026-03-15"),
+    )
+    path = tmp_path / "track_record.json"
+    save_ledger(led, path)
+    assert load_ledger(path)["months"] == led["months"]
+
+
+def test_a_corrupt_ledger_raises_rather_than_resetting(tmp_path):
+    """Silently returning an empty ledger would erase history on the next write."""
+    path = tmp_path / "track_record.json"
+    path.write_text('{"nonsense": true}')
+    with pytest.raises(ValueError):
+        load_ledger(path)
+
+
+def test_missing_ledger_starts_empty(tmp_path):
+    assert load_ledger(tmp_path / "absent.json")["months"] == {}
+
+
+def test_the_shipped_ledger_is_readable_and_starts_at_inception():
+    led = load_ledger()
+    assert led["inception"] == str(INCEPTION)
+    assert led["benchmark"] == TRACK_RECORD_CONFIG["benchmark"]
+    for key in led["months"]:
+        assert pd.Period(key, freq="M") >= INCEPTION
+
+
+def test_fingerprint_changes_with_configuration():
+    a = config_fingerprint(**TRACK_RECORD_CONFIG)
+    b = config_fingerprint(**{**TRACK_RECORD_CONFIG, "top_n": 30})
+    assert a != b
+    assert a == config_fingerprint(**TRACK_RECORD_CONFIG)
+
+
+# ── Reconstructed months are labelled as such ────────────────────────────────
+
+def test_a_backfill_marks_older_months_as_reconstructed():
+    """Only the month that just closed was struck from data as it stood then.
+
+    Everything older in the same write is a reconstruction from today's
+    universe and today's prices, and must not be presented as equal evidence.
+    """
+    led, added, _ = finalize_months(
+        empty_ledger(),
+        _curve({"2026-01": 0.10, "2026-02": 0.05, "2026-03": 0.02, "2026-04": 0.01}),
+        _flat(), "cfg1", as_of=pd.Timestamp("2026-05-10"),
+    )
+    assert added == ["2026-01", "2026-02", "2026-03", "2026-04"]
+    assert led["months"]["2026-04"]["origin"] == "recorded"
+    for key in ("2026-01", "2026-02", "2026-03"):
+        assert led["months"][key]["origin"] == "backfill"
+
+
+def test_the_monthly_run_records_rather_than_backfills():
+    """The scheduled updater writes exactly one month, and it is a real record."""
+    led, _, _ = finalize_months(
+        empty_ledger(), _curve({"2026-01": 0.10}), _flat(), "cfg1",
+        as_of=pd.Timestamp("2026-02-10"),
+    )
+    led, added, _ = finalize_months(
+        led, _curve({"2026-01": 0.10, "2026-02": 0.07}), _flat(), "cfg1",
+        as_of=pd.Timestamp("2026-03-10"),
+    )
+    assert added == ["2026-02"]
+    assert led["months"]["2026-02"]["origin"] == "recorded"
+    assert summary_stats(led)["recorded"] == 2
+
+
+def test_summary_splits_recorded_from_backfilled():
+    led, _, _ = finalize_months(
+        empty_ledger(), _curve({"2026-01": 0.10, "2026-02": 0.05}), _flat(),
+        "cfg1", as_of=pd.Timestamp("2026-03-10"),
+    )
+    s = summary_stats(led)
+    assert s["backfilled"] == 1 and s["recorded"] == 1
+    assert s["backfilled"] + s["recorded"] == s["months"]
+
+
+# ── Universe basis is recorded per month ─────────────────────────────────────
+
+def test_a_month_records_whether_it_was_survivorship_free():
+    """pit_from is a SIGNAL date; a signal on 27 Feb governs March."""
+    led, _, _ = finalize_months(
+        empty_ledger(),
+        _curve({"2026-01": 0.10, "2026-02": 0.05, "2026-03": 0.02, "2026-04": 0.01}),
+        _flat(), "cfg1", as_of=pd.Timestamp("2026-05-10"),
+        pit_from="2026-02-27",
+    )
+    assert led["months"]["2026-01"]["universe"] == "current"
+    assert led["months"]["2026-02"]["universe"] == "current"
+    assert led["months"]["2026-03"]["universe"] == "point_in_time"
+    assert led["months"]["2026-04"]["universe"] == "point_in_time"
+
+
+def test_without_membership_every_month_is_current_universe():
+    led, _, _ = finalize_months(
+        empty_ledger(), _curve({"2026-01": 0.10}), _flat(), "cfg1",
+        as_of=pd.Timestamp("2026-02-10"),
+    )
+    assert led["months"]["2026-01"]["universe"] == "current"
+
+
+def test_summary_splits_point_in_time_from_current_universe():
+    led, _, _ = finalize_months(
+        empty_ledger(),
+        _curve({"2026-01": 0.10, "2026-02": 0.05, "2026-03": 0.02}),
+        _flat(), "cfg1", as_of=pd.Timestamp("2026-04-10"),
+        pit_from="2026-01-31",
+    )
+    s = summary_stats(led)
+    assert s["point_in_time"] == 2      # Feb, Mar
+    assert s["current_universe"] == 1   # Jan
+    assert s["point_in_time"] + s["current_universe"] == s["months"]
+
+
+def test_universe_basis_is_frozen_with_the_month():
+    """A later run with better membership must not relabel a stored month."""
+    led, _, _ = finalize_months(
+        empty_ledger(), _curve({"2026-01": 0.10}), _flat(), "cfg1",
+        as_of=pd.Timestamp("2026-02-10"),
+    )
+    assert led["months"]["2026-01"]["universe"] == "current"
+    led, added, _ = finalize_months(
+        led, _curve({"2026-01": 0.10}), _flat(), "cfg1",
+        as_of=pd.Timestamp("2026-02-10"), pit_from="2026-01-01",
+    )
+    assert added == []
+    assert led["months"]["2026-01"]["universe"] == "current"
+
+
+# ── The combined grid ────────────────────────────────────────────────────────
+
+def _three_series_ledger() -> dict:
+    led = empty_ledger()
+    led["months"] = {
+        "2026-01": {"strategy": 0.10, "benchmark": 0.04, "alpha": 0.06},
+        "2026-02": {"strategy": -0.05, "benchmark": -0.02, "alpha": -0.03},
+    }
+    return led
+
+
+def test_combined_grid_puts_all_three_series_in_one_table():
+    """One glance down a column, rather than three tabs and a memory test."""
+    from src.engine.track_record import build_combined_grid
+
+    grid = build_combined_grid(_three_series_ledger())
+    assert list(grid["SERIES"]) == ["Strategy", "Nifty 500", "Alpha"]
+    assert list(grid.columns[:2]) == ["SERIES", "YEAR"]
+    assert (grid["YEAR"] == 2026).all()
+
+    by = grid.set_index("SERIES")
+    assert by.loc["Strategy", "JAN"] == pytest.approx(0.10)
+    assert by.loc["Nifty 500", "JAN"] == pytest.approx(0.04)
+    assert by.loc["Alpha", "JAN"] == pytest.approx(0.06)
+
+
+def test_combined_grid_matches_the_per_series_grids():
+    """The two views must not be able to disagree about any number."""
+    from src.engine.track_record import build_combined_grid
+
+    led = _three_series_ledger()
+    combined = build_combined_grid(led).set_index("SERIES")
+    for field, label in (
+        ("strategy", "Strategy"), ("benchmark", "Nifty 500"), ("alpha", "Alpha"),
+    ):
+        single = build_grid(led, field=field).iloc[0]
+        # S40 (owner, 7 Oct): the Alpha row's year / quarter cells are strategy
+        # minus index, not the per-series grid's compounded monthly alphas.
+        cols = ("JAN", "FEB") if field == "alpha" else ("JAN", "FEB", "CY RETURN", "FY RETURN", "Q1")
+        for col in cols:
+            a, b = combined.loc[label, col], single[col]
+            if a is None or (isinstance(a, float) and np.isnan(a)):
+                assert b is None or np.isnan(b)
+            else:
+                assert a == pytest.approx(b)
+
+
+def test_combined_grid_routes_mtd_to_the_right_series():
+    from src.engine.track_record import build_combined_grid
+
+    grid = build_combined_grid(
+        _three_series_ledger(),
+        mtd_period=pd.Period("2026-03", freq="M"),
+        mtd_values={"strategy": 0.03, "benchmark": 0.01, "alpha": 0.02},
+    ).set_index("SERIES")
+    assert grid.loc["Strategy", "MAR"] == pytest.approx(0.03)
+    assert grid.loc["Nifty 500", "MAR"] == pytest.approx(0.01)
+    assert grid.loc["Alpha", "MAR"] == pytest.approx(0.02)
+
+
+def test_combined_grid_groups_rows_by_year():
+    from src.engine.track_record import build_combined_grid
+
+    led = empty_ledger()
+    led["months"] = {
+        "2026-01": {"strategy": 0.10, "benchmark": 0.04, "alpha": 0.06},
+        "2027-01": {"strategy": 0.20, "benchmark": 0.05, "alpha": 0.15},
+    }
+    grid = build_combined_grid(led)
+    assert list(grid["YEAR"]) == [2026, 2026, 2026, 2027, 2027, 2027]
+    assert list(grid["SERIES"][:3]) == ["Strategy", "Nifty 500", "Alpha"]
+
+
+def test_a_series_with_nothing_recorded_still_gets_a_row():
+    """A vanishing row would silently misalign the year block."""
+    from src.engine.track_record import build_combined_grid
+
+    led = empty_ledger()
+    led["months"] = {"2026-01": {"strategy": 0.10, "benchmark": None, "alpha": None}}
+    grid = build_combined_grid(led)
+    assert list(grid["SERIES"]) == ["Strategy", "Nifty 500", "Alpha"]
+    # pandas coerces None to NaN in a float column; the renderer treats both as
+    # "no value", so assert emptiness rather than a particular null.
+    assert pd.isna(grid.set_index("SERIES").loc["Nifty 500", "JAN"])
+    assert grid.set_index("SERIES").loc["Strategy", "JAN"] == pytest.approx(0.10)
+
+
+def test_combined_grid_of_an_empty_ledger_is_empty():
+    from src.engine.track_record import build_combined_grid
+
+    assert build_combined_grid(empty_ledger()).empty
+
+
+# ── The running month counts, everywhere ─────────────────────────────────────
+
+def _mtd(period="2026-03", strategy=0.02, benchmark=0.01, as_of="2026-03-03"):
+    return {
+        "period": pd.Period(period, freq="M"),
+        "strategy": strategy,
+        "benchmark": benchmark,
+        "as_of": pd.Timestamp(as_of),
+    }
+
+
+def test_the_headline_includes_the_running_month():
+    led, _, _ = finalize_months(
+        empty_ledger(), _curve({"2026-01": 0.10, "2026-02": 0.05}), _flat(),
+        "cfg1", as_of=pd.Timestamp("2026-03-03"),
+    )
+    frozen = summary_stats(led)
+    live = summary_stats(led, mtd=_mtd(strategy=0.02))
+
+    assert frozen["total_return"] == pytest.approx(1.10 * 1.05 - 1)
+    assert live["total_return"] == pytest.approx(1.10 * 1.05 * 1.02 - 1)
+    assert live["includes_mtd"] is True
+    assert live["frozen_months"] == 2
+    assert live["months"] == 3
+
+
+def test_headline_and_grid_agree_on_the_same_period():
+    """The bug this fixes: "+38.7% since inception" beside "CY +37.2%"."""
+    from src.engine.track_record import build_combined_grid
+
+    led, _, _ = finalize_months(
+        empty_ledger(), _curve({"2026-01": 0.10, "2026-02": 0.05}), _flat(),
+        "cfg1", as_of=pd.Timestamp("2026-03-03"),
+    )
+    mtd = _mtd(strategy=0.02)
+    headline = summary_stats(led, mtd=mtd)["total_return"]
+    grid = build_combined_grid(
+        led, mtd_period=mtd["period"], mtd_values={"strategy": mtd["strategy"]}
+    )
+    cy = grid[grid["SERIES"] == "Strategy"].iloc[0]["CY RETURN"]
+    assert headline == pytest.approx(cy)
+
+
+def test_a_partial_month_annualises_on_the_time_actually_elapsed():
+    """Three days is 0.1 of a month, not a whole one.
+
+    Counting it whole divides the return by more time than has passed and
+    understates the annualised figure.
+    """
+    led, _, _ = finalize_months(
+        empty_ledger(), _curve({"2026-01": 0.10, "2026-02": 0.05}), _flat(),
+        "cfg1", as_of=pd.Timestamp("2026-03-03"),
+    )
+    early = summary_stats(led, mtd=_mtd(as_of="2026-03-03"))
+    late = summary_stats(led, mtd=_mtd(as_of="2026-03-31"))
+
+    assert early["elapsed_months"] == pytest.approx(2 + 3 / 31)
+    assert late["elapsed_months"] == pytest.approx(3.0)
+    # Same return over less elapsed time annualises higher.
+    assert early["ann_return"] > late["ann_return"]
+
+
+def test_the_running_month_never_enters_the_ledger():
+    """Including it in the headline must not freeze it."""
+    led, _, _ = finalize_months(
+        empty_ledger(), _curve({"2026-01": 0.10}), _flat(), "cfg1",
+        as_of=pd.Timestamp("2026-02-03"),
+    )
+    summary_stats(led, mtd=_mtd(period="2026-02"))
+    assert list(led["months"]) == ["2026-01"]
+
+
+def test_without_mtd_the_headline_is_frozen_only():
+    """The updater script reports what it wrote, so it must not add MTD."""
+    led, _, _ = finalize_months(
+        empty_ledger(), _curve({"2026-01": 0.10}), _flat(), "cfg1",
+        as_of=pd.Timestamp("2026-02-03"),
+    )
+    s = summary_stats(led)
+    assert s["includes_mtd"] is False
+    assert s["months"] == s["frozen_months"] == 1
+
+
+def test_missing_future_ledger_is_expected_and_not_a_warning(tmp_path, monkeypatch):
+    """Nano/Combined ledgers do not exist until their October 2026 inception."""
+    warnings = []
+    monkeypatch.setattr(
+        track_record,
+        "_current_month",
+        lambda: pd.Period("2026-09", freq="M"),
+    )
+    monkeypatch.setattr(
+        track_record.logger,
+        "warning",
+        lambda *args, **kwargs: warnings.append(args),
+    )
+
+    led = track_record.load_ledger(
+        tmp_path / "track_record_nano.json",
+        pd.Period("2026-10", freq="M"),
+    )
+
+    assert led["inception"] == "2026-10"
+    assert led["months"] == {}
+    assert warnings == []
+
+
+def test_combined_grid_alpha_is_strategy_minus_index_for_the_year_and_quarters():
+    """S40 (owner, 7 Oct 2026): the plain difference on every page."""
+    from src.engine.track_record import build_combined_grid
+
+    by = build_combined_grid(_three_series_ledger()).set_index("SERIES")
+    for col in ("CY RETURN", "FY RETURN", "Q1"):
+        s, b, a = by.loc["Strategy", col], by.loc["Nifty 500", col], by.loc["Alpha", col]
+        if pd.notna(s) and pd.notna(b):
+            assert a == pytest.approx(s - b)
+
+
+def test_no_warning_during_a_systems_first_month_but_one_after(tmp_path, monkeypatch):
+    # Log, 7 Oct 2026: Nano Cap and Combined (first month Oct 2026) warned "No
+    # track-record ledger" every day of October; none is frozen before 1 Nov.
+    warnings = []
+    monkeypatch.setattr(track_record.logger, "warning", lambda *a, **k: warnings.append(a))
+    monkeypatch.setattr(track_record, "_current_month", lambda: pd.Period("2026-10", freq="M"))
+    track_record.load_ledger(tmp_path / "track_record_nano.json", pd.Period("2026-10", freq="M"))
+    assert warnings == []
+    monkeypatch.setattr(track_record, "_current_month", lambda: pd.Period("2026-12", freq="M"))
+    track_record.load_ledger(tmp_path / "track_record_nano.json", pd.Period("2026-10", freq="M"))
+    assert len(warnings) == 1          # by December it should exist
+
+
+def test_the_current_month_does_not_warn_about_the_timezone():
+    import warnings
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        assert isinstance(track_record._current_month(), pd.Period)

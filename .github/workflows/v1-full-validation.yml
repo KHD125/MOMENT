@@ -1,0 +1,117 @@
+name: V1 Full Validation
+
+on:
+  push:
+    branches: [main, agent/stage4b-execution, agent/stage4b-second-archetype]
+    paths-ignore:
+      - 'src/storage/**'
+      - 'r2/consumers/**'
+      - 'r2/raw/**'
+      - 'scripts/r2_*.py'
+      - 'scripts/build_trading_sessions.py'
+      - 'scripts/build_market_cap_history.py'
+      - 'tests/test_r2_*.py'
+      - 'tests/test_build_trading_sessions.py'
+      - 'tests/test_market_cap_history.py'
+      - '.github/workflows/r2-*.yml'
+      - '.github/workflows/r2_*.yml'
+      - 'docs/R2_*.md'
+      - 'docs/MARKET_DATA_ARCHIVE_R2_SPEC.md'
+      - 'docs/RAW_PRICE_REBUILD.md'
+  pull_request:
+    branches: [main]
+    paths-ignore:
+      - 'r2/raw/**'
+      - 'src/storage/**'
+      - 'r2/consumers/**'
+      - 'scripts/r2_*.py'
+      - 'scripts/build_trading_sessions.py'
+      - 'scripts/build_market_cap_history.py'
+      - 'tests/test_r2_*.py'
+      - 'tests/test_build_trading_sessions.py'
+      - 'tests/test_market_cap_history.py'
+      - '.github/workflows/r2-*.yml'
+      - '.github/workflows/r2_*.yml'
+      - 'docs/R2_*.md'
+      - 'docs/MARKET_DATA_ARCHIVE_R2_SPEC.md'
+      - 'docs/RAW_PRICE_REBUILD.md'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+jobs:
+  validate:
+    env:
+      PYTHONPATH: .
+    # Feature-branch pushes are never the V1 deployment/validation target.
+    # R2 work can be developed on branches without launching Stage-4B.
+    if: github.event_name != 'push' || github.ref == 'refs/heads/main' || github.ref == 'refs/heads/agent/stage4b-execution' || github.ref == 'refs/heads/agent/stage4b-second-archetype'
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version-file: .python-version
+      # pyyaml is a TEST-only dependency, deliberately not in requirements.txt:
+      # the app never parses YAML. Without it here, tests/test_daily_sync_workflow.py
+      # module-skips and the guards on the sync workflow -- the ones that catch a
+      # step declaring both `uses` and `run`, which invalidated the file and cost
+      # 200 consecutive runs -- silently do not run in the only place that matters.
+      - run: pip install -r requirements.txt pytest pyyaml
+
+      # Everything, R2 suites included. They are hermetic (fakes, no
+      # credentials, ~2 s), and they also depend on code no R2 path filter
+      # watches -- src/core/tickers.py, the membership builder, and above all
+      # requirements.txt. Excluded here, a pandas or pyarrow bump ran them
+      # nowhere. R2 Focused Validation still runs them for R2-only changes,
+      # which this workflow's paths-ignore skips.
+      - name: Full regression suite
+        run: python -m pytest -q
+
+      - name: Compile application and source
+        run: python -m compileall -q app.py src scripts
+
+      - name: Stage-2 canonical ranking artifact hand-off
+        run: |
+          python - <<'PY'
+          from agent.quant_hand_off import load_quant_snapshot
+
+          snapshot = load_quant_snapshot()
+          print(f"STAGE2_HANDOFF_AS_OF={snapshot.as_of.isoformat()}")
+          print(f"STAGE2_HANDOFF_ROWS={len(snapshot.rows)}")
+          print(f"STAGE2_HANDOFF_PIPELINE={snapshot.pipeline_version}")
+          print(f"STAGE2_HANDOFF_PRICE_SOURCE={snapshot.price_source}")
+          print(f"STAGE2_HANDOFF_ARTIFACT={snapshot.source_artifact}")
+          print("STAGE2_HANDOFF=PASS")
+          PY
+
+      - name: Stage-3 live hierarchy output
+        run: python scripts/stage3_live_validation.py
+
+      - name: Retain Stage-3 live hierarchy artifact
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: stage3-live-hierarchy
+          path: artifacts/stage3_live_hierarchy.md
+          if-no-files-found: warn
+
+      - name: Enforce deprecated Streamlit HTML cleanup
+        run: |
+          if git grep -n -E "components.v1|components.html|streamlit.components" -- app.py src; then
+            echo "Deprecated Streamlit component HTML call remains in application source"
+            exit 1
+          fi
+          echo "DEPRECATED_STREAMLIT_HTML=NONE"
+
+      - name: Headless Streamlit runtime smoke test
+        run: python scripts/headless_smoke.py
+
+      - name: Upload V1 validation artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: v1-validation-artifacts
+          path: artifacts/
+          if-no-files-found: error
+

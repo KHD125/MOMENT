@@ -1,0 +1,101 @@
+name: R2 observed trading-session publication
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "scripts/build_trading_sessions.py"
+      - "tests/test_build_trading_sessions.py"
+      - "scripts/r2_screener_history.py"
+      - "scripts/check_observed_sessions.py"
+      - ".github/workflows/r2_observed_trading_sessions.yml"
+  workflow_dispatch:
+  # Built from the published Screener store, so rebuilt after every Screener
+  # sync. It had no schedule at all: it only refreshed when this file changed.
+  workflow_run:
+    workflows: ["Screener daily price sync (overnight)"]
+    types: [completed]
+
+permissions:
+  contents: read
+
+# Never let two runs of this workflow write the same objects at once.
+concurrency:
+  group: r2-publish-r2_observed_trading_sessions
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    # Chained runs only after a successful upstream run: a failed one published nothing new.
+    if: github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
+      R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+      R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+      R2_ENDPOINT: ${{ secrets.R2_ENDPOINT }}
+      R2_BUCKET: ${{ secrets.R2_BUCKET }}
+      PYTHONPATH: .
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version-file: .python-version
+          cache: pip
+
+      - run: pip install -r requirements.txt
+
+      - name: Download production Screener release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/r2-observed
+          gh release download data-latest \
+            --repo "$GITHUB_REPOSITORY" \
+            --pattern "screener_prices.parquet" \
+            --dir /tmp/r2-observed \
+            --clobber
+          test -s /tmp/r2-observed/screener_prices.parquet
+
+      # Read-only: every prices/screener revision in R2 -- dates, where the
+      # daily history starts, symbols. Runs before the coverage check so its
+      # evidence is in the log whether or not that check passes.
+      - name: Screener store history across R2 revisions
+        run: python scripts/r2_screener_history.py
+
+      - name: Build observed trading-session archive
+        run: |
+          python scripts/build_trading_sessions.py \
+            --prices /tmp/r2-observed/screener_prices.parquet \
+            --output /tmp/r2-observed/trading_sessions_observed.parquet
+
+      # Daily recent year, and never fewer sessions than the
+      # archive already published (scripts/check_observed_sessions.py). This
+      # replaced `len >= 1000`, which tested how the store was built rather
+      # than whether history was lost.
+      - name: Validate observed-session coverage
+        run: |
+          python scripts/check_observed_sessions.py \
+            --path /tmp/r2-observed/trading_sessions_observed.parquet
+
+      - name: Publish observed sessions to R2
+        run: |
+          python scripts/r2_publish.py \
+            --path /tmp/r2-observed/trading_sessions_observed.parquet \
+            --dataset trading_sessions/observed \
+            --source production_price_archive \
+            --key-root archive/trading_days/observed \
+            --pipeline-version "r2_observed_sessions_${{ github.sha }}" \
+            --release-tag data-latest
+
+      - name: Audit published observed sessions
+        run: |
+          AS_OF="$(python - <<'PY'
+          import pandas as pd
+          print(pd.read_parquet("/tmp/r2-observed/trading_sessions_observed.parquet")["date"].max().date())
+          PY
+          )"
+          python scripts/r2_audit.py --dataset trading_sessions/observed --as-of "$AS_OF"

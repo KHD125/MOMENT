@@ -1,0 +1,415 @@
+name: Daily NSE Momentum Data Sync
+
+on:
+  schedule:
+    # 17:30 UTC = 23:00 IST (11:00 PM IST) Monday to Friday (Trading Days).
+    #
+    # NSE publishes the PR bhavcopy -- the archive carrying market caps --
+    # after 21:00 IST, and not at a fixed minute. The 22:00 IST slot fired at
+    # 22:29 IST on 2026-08-18 and the zip was NOT there yet; the same file
+    # fetched cleanly at 22:51. Running at 23:00 IST leaves the publication
+    # window comfortably behind while staying on the same IST calendar day, so
+    # recent_trading_days() still resolves "today" to the session just closed.
+    #
+    # GitHub runs scheduled workflows on a best-effort queue, and on this repo
+    # the delay is HOURS, not minutes. Measured on 2026-09-18:
+    #
+    #     daily  02:00 UTC slot  ->  fired 06:54   (4h54m late)
+    #     daily  17:30 UTC slot  ->  fired 19:47   (2h17m late)
+    #     screener 18:45 slot    ->  fired 21:15   (2h30m late)
+    #
+    # An earlier version of this comment claimed ~28 minutes, which was a
+    # single observation generalised into a rule. Both slots are positioned so
+    # that hours of slack still land them usefully, and nothing downstream
+    # depends on the wall-clock time: the download gate refuses a session that
+    # has not settled, and the ranking-date rule refuses one the vendor has not
+    # finished, whenever the job happens to run. The schedule is a request, not
+    # a guarantee -- the AsOf dates in the footer are what make a missed run
+    # visible.
+    - cron: '30 17 * * 1-5'
+
+    # 02:00 UTC, nominally 07:30 IST -- the morning after each trading session.
+    # In practice GitHub's queue puts it hours later (06:54 UTC on 2026-09-18,
+    # so nearer 12:30 IST). That is tolerable precisely because this slot is
+    # for RECOVERY rather than freshness: it re-requests settled history, and
+    # settled history does not care what time the job runs.
+    #
+    # This run does NOT make the screener fresher, and it is not meant to.
+    # Yahoo publishes an Indian session over about a day and a half, largest
+    # names first, measured on 2026-09-17:
+    #
+    #     ~10h after close (the 23:00 slot)   150/750    20%
+    #     ~15h after close (this slot)        378/750    50%
+    #     ~34h after close                    750/750   100%
+    #
+    # The ranking needs a near-complete session, so at 50% it still lands on
+    # the previous day exactly as the night run did. What this slot buys is
+    # RECOVERY: the night run is the only thing that fills the cache, and when
+    # it is delayed past its window, throttled by NSE, or fails outright, the
+    # gap currently waits a full day. heal_days re-requests 45 days of settled
+    # history on every run and deliberately bypasses the download gate, so this
+    # is a genuine second attempt rather than a no-op.
+    #
+    # Every day, including Sunday and Monday. There is no session behind
+    # those two, but the run is not only chasing the newest bar: heal_days
+    # re-requests the trailing 45 days of SETTLED history on every run, and
+    # Yahoo restates an Indian series for weeks after the fact -- split
+    # adjustments typically land 1-4 weeks late. A Sunday run costs one job
+    # and can still repair a close from three weeks ago.
+    #
+    # What it does NOT do is deepen the archive. heal_days reaches back 45
+    # days and no further; the 10-year window is rebuilt only by the weekly
+    # FORCE_FULL run, which is the one place a longer PRICE_ARCHIVE_PERIOD
+    # takes effect.
+    - cron: '0 2 * * *'
+  workflow_dispatch: # Allows manual 1-click execution anytime from GitHub Actions tab
+
+  # Re-rank as soon as new Screener prices are published.
+  #
+  # The precomputed ranking is only accepted while its price fingerprint
+  # matches the Screener store production reads. The 17:30 slot ranks the
+  # store the PREVIOUS night published; the Screener job then advances it
+  # (~22:00 UTC), and production logged "Precomputed ranking rejected
+  # (price_fingerprint differs); computing instead." from then until the 02:00
+  # slot landed (~07:00 UTC) -- 2026-09-24 03:30-07:02 and 2026-09-25 01:16
+  # onwards. That is the Indian morning, when readers are actually on the app,
+  # paying the full engine cost on every cold cache. Chaining here closes the
+  # gap to minutes; the concurrency group below queues it behind any running
+  # slot.
+  workflow_run:
+    workflows: ["Screener daily price sync (overnight)"]
+    types: [completed]
+
+permissions:
+  contents: write
+
+# Two scheduled slots a day now, plus manual dispatch. They must not overlap:
+# both write the same rotating price cache and both commit to main, and a
+# second runner starting mid-commit would race the rebase-and-retry push below.
+# Queue rather than cancel -- a run that is already fetching prices is worth
+# finishing, and the later one starts from its freshly saved cache.
+concurrency:
+  group: daily-sync
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    # A failed Screener run published nothing new, so there is nothing to re-rank.
+    if: github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v7
+
+      # A step may declare `uses` or `run`, never both. Having both made this
+      # workflow file invalid, so GitHub failed it on every push and the
+      # nightly schedule never fired -- 200 consecutive failed runs.
+      #
+      # The key must CHANGE every run. actions/cache treats an entry as
+      # immutable: when the key already exists it skips the save outright --
+      # "Cache hit occurred on the primary key price-data-Linux, not saving
+      # cache", which this job logged on every run it ever made. The cached
+      # frame was therefore frozen on the day it was first written, while the
+      # incremental top-up had to re-fetch one more session for every day that
+      # passed since. run_id makes each run write its own entry; restore-keys
+      # falls back to the newest previous one, so the job still starts from
+      # the freshest history available.
+      - name: Restore price cache
+        id: restore-price-cache
+        uses: actions/cache/restore@v6
+        with:
+          path: ${{ github.workspace }}/data_cache/
+          key: price-data-${{ runner.os }}-${{ github.run_id }}
+          restore-keys: |
+            price-data-${{ runner.os }}-
+            price-data-
+
+      # cache-hit is an EXACT-key match, and the key now carries this run's id,
+      # so it is false on every run by construction -- it would report "false"
+      # while a perfectly good cache was restored. The matched key is the one
+      # that answers the question actually being asked here: which run's
+      # history did this one start from, and did it start from any at all.
+      - name: Report cache restore result
+        run: |
+          MATCHED="${{ steps.restore-price-cache.outputs.cache-matched-key }}"
+          if [ -n "$MATCHED" ]; then
+            echo "Price cache restored from: $MATCHED"
+          else
+            echo "::warning::No price cache matched; this run rebuilds the history from scratch."
+          fi
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version-file: .python-version
+          cache: 'pip'
+
+      - name: Install Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      # NSE's F&O list, read by the corporate-actions rule before ranking: an
+      # F&O stock has no circuit limit, so its one-day move beyond 35% is real
+      # unless Screener later restates it. Non-blocking: a failed download
+      # keeps the committed list.
+      - name: Refresh the F&O symbol list
+        run: python scripts/sync_fo_symbols.py || echo "::warning::F&O list refresh failed; using the committed list."
+
+      # NSE's daily bundle for the last few sessions, so the month-end market
+      # caps the extra universe is built from are in R2 by the time the step
+      # below runs. The NSE collector has its own schedule, but GitHub has not
+      # fired it; this keeps the 30 Sep list from depending on it. Idempotent:
+      # a day already in R2 is skipped. Non-blocking.
+      - name: Collect the last NSE sessions
+        env:
+          PYTHONPATH: .
+          R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          R2_ENDPOINT: ${{ secrets.R2_ENDPOINT }}
+          R2_BUCKET: ${{ secrets.R2_BUCKET }}
+        run: python scripts/nse_collect.py --recent 3 || echo "::warning::NSE collection failed; the extra universe keeps the last list."
+
+      # The Nifty 500 / Nifty 50 benchmark closes (data/benchmarks.csv),
+      # extended from NSE's daily bundle, Screener for any session NSE does
+      # not give. Replaces the Yahoo download (owner, 2026-10-02). Committed
+      # with the rest of data/ below. Non-blocking: a failure keeps the file.
+      - name: Extend the benchmark closes
+        env:
+          PYTHONPATH: .
+        run: python scripts/build_benchmarks.py --update || echo "::warning::Benchmark update failed; the committed file is used."
+
+      # The extra universe (every stock of ₹2,000 Cr or more outside the 750,
+      # src/engine/extra_universe.py): rebuilt from NSE's market-cap file
+      # only when a new month-end session is in R2, else a no-op. Written to
+      # data/ and committed with the rest. Non-blocking: a failure keeps the
+      # committed list, and nothing ranks off it by default.
+      - name: Refresh the extra universe at month-end
+        env:
+          PYTHONPATH: .
+          R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          R2_ENDPOINT: ${{ secrets.R2_ENDPOINT }}
+          R2_BUCKET: ${{ secrets.R2_BUCKET }}
+        run: python scripts/build_extra_universe.py || echo "::warning::Extra universe refresh failed; keeping the committed list."
+
+      # Daily closes over Screener's weekly stretch for the Nano Cap stocks
+      # (data/reference/weekly_fill_nano.parquet, TODO S57): rebuilt from the
+      # long file's NSE packs on the release only when a stock on the Nano Cap
+      # list (now or any month-end) is not on file, else a no-op. Committed with
+      # the rest of data/. Non-blocking: a failure keeps the committed file.
+      - name: Nano Cap weekly-fill closes for new list members
+        env:
+          PYTHONPATH: .
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          R2_ENDPOINT: ${{ secrets.R2_ENDPOINT }}
+          R2_BUCKET: ${{ secrets.R2_BUCKET }}
+        run: |
+          set +e
+          python scripts/build_weekly_fill_extra.py --nano --if-missing
+          rc=$?
+          set -e
+          if [ "$rc" = "3" ]; then
+            mkdir -p packs
+            gh release download data-latest --repo "$GITHUB_REPOSITORY" --dir packs \
+              --pattern nse_raw_pack.parquet --pattern nse_actions_pack.parquet --pattern bse_daily.parquet --clobber \
+              && python scripts/build_weekly_fill_extra.py --nano \
+                   --raw-pack packs/nse_raw_pack.parquet --actions-pack packs/nse_actions_pack.parquet \
+                   --actions-list r2 --bse packs/bse_daily.parquet \
+              || echo "::warning::Nano Cap weekly-fill closes not rebuilt; the committed file is kept."
+            rm -rf packs
+          elif [ "$rc" != "0" ]; then
+            echo "::warning::Nano Cap weekly-fill check failed (exit $rc); the committed file is kept."
+          fi
+
+      # A TradingView sector for every stock the lists hold: TradingView's
+      # screener first, then Screener.in mapped onto TradingView's names
+      # (scripts/classify_missing.py). Writes data/, committed below. A stock
+      # neither knows stays "Unclassified". Non-blocking.
+      - name: Fill in missing sectors
+        env:
+          PYTHONPATH: .
+        run: python scripts/classify_missing.py || echo "::warning::Sector lookup failed; unknown stocks stay Unclassified."
+
+      # Re-ask TradingView about EVERY stock, not just the blank ones: a stock
+      # it reclassified (or the file got wrong) was never corrected before.
+      # Weekly (Friday UTC, the last scheduled run of the week) or on a manual
+      # run; six batched requests; changes only where TradingView answers.
+      - name: Refresh every sector from TradingView (weekly)
+        env:
+          PYTHONPATH: .
+        run: |
+          if [ "$(date -u +%u)" = "5" ] || [ "$GITHUB_EVENT_NAME" = "workflow_dispatch" ]; then
+            python scripts/classify_missing.py --refresh || echo "::warning::Sector refresh failed; keeping the committed classification."
+          else
+            echo "Not Friday and not a manual run; skipping the weekly sector refresh."
+          fi
+
+      - name: Run Automated Daily Market Sync
+        env:
+          PYTHONPATH: .
+        run: |
+          python scripts/sync_data.py
+          python scripts/update_membership_history.py
+
+      # The Nano Cap and Combined rankings, precomputed like the 750's (owner,
+      # 2026-09-27: nightly precompute for all systems). Ranked from the same
+      # frames the app builds; the app uses a table only when its contract
+      # matches. Non-blocking: without it the app computes the ranking itself.
+      - name: Precompute the Nano Cap and Combined rankings
+        env:
+          PYTHONPATH: .
+        run: python scripts/precompute_systems.py || echo "::warning::Nano Cap / Combined precompute failed; the app will compute them."
+
+      # Explicitly save, with the SAME rotating key the restore asked for, so
+      # there is exactly one writer. Splitting restore from save also removes
+      # the combined action's own post-job save, which used to fire alongside
+      # this step and skip for the same reason.
+      - name: Save price cache
+        if: always()
+        uses: actions/cache/save@v6
+        with:
+          path: ${{ github.workspace }}/data_cache/
+          key: price-data-${{ runner.os }}-${{ github.run_id }}
+
+      # The precomputed rankings, published as release assets (replaced in
+      # place, so no git history accumulates). No Yahoo price file is produced
+      # any more (owner, 2026-10-02): the app reads Screener's store and NSE's
+      # committed closes.
+      - name: Publish rankings to the release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # A single rolling tag. The release is created once and its assets
+          # replaced every run.
+          gh release view data-latest --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 || \
+            gh release create data-latest \
+              --repo "$GITHUB_REPOSITORY" \
+              --title "Latest data snapshots" \
+              --notes "Rolling data published by the daily sync. Replaced in place; not intended as a versioned release." \
+              --latest=false
+
+          for SYS in nano combined; do
+            R="${{ github.workspace }}/data_cache/rankings_${SYS}.parquet"
+            if [ -f "$R" ]; then
+              cp "$R" "${{ github.workspace }}/rankings_${SYS}.parquet"
+              gh release upload data-latest "${{ github.workspace }}/rankings_${SYS}.parquet" \
+                --repo "$GITHUB_REPOSITORY" --clobber
+              echo "Uploaded rankings_${SYS}.parquet to release data-latest."
+            fi
+          done
+
+          RANK="${{ github.workspace }}/data_cache/rankings.parquet"
+          if [ -f "$RANK" ]; then
+            ls -lh "$RANK"
+            cp "$RANK" "${{ github.workspace }}/rankings.parquet"
+            gh release upload data-latest "${{ github.workspace }}/rankings.parquet" \
+              --repo "$GITHUB_REPOSITORY" --clobber
+            echo "Uploaded rankings.parquet to release data-latest."
+          else
+            echo "::warning::No precomputed ranking was produced; the app will compute it."
+          fi
+
+      # The rankings published to the rolling GitHub Release are also published
+      # to the durable R2 archive. R2 publication is immutable: a retry
+      # verifies an existing identical object rather than replacing it. No
+      # Yahoo price file is produced or published any more (owner, 2026-10-02).
+      - name: Publish validated datasets to R2
+        env:
+          R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          R2_ENDPOINT: ${{ secrets.R2_ENDPOINT }}
+          R2_BUCKET: ${{ secrets.R2_BUCKET }}
+          PYTHONPATH: .
+        run: |
+          set -euo pipefail
+
+          # Nano Cap and Combined rankings, when the precompute produced them.
+          for SYS in nano combined; do
+            if [ -f "rankings_${SYS}.parquet" ]; then
+              python scripts/r2_publish.py \
+                --path "rankings_${SYS}.parquet" \
+                --dataset "snapshots/rankings_${SYS}" \
+                --source system1 \
+                --key-root "snapshots/rankings_${SYS}" \
+                --pipeline-version "r2-daily-${GITHUB_SHA}" \
+                --release-tag data-latest
+            fi
+          done
+
+          if [ -f rankings.parquet ]; then
+            python scripts/r2_publish.py \
+              --path rankings.parquet \
+              --dataset snapshots/rankings \
+              --source system1 \
+              --key-root snapshots/rankings \
+              --pipeline-version "r2-daily-${GITHUB_SHA}" \
+              --release-tag data-latest
+          else
+            echo "::warning::No rankings.parquet produced; no ranking snapshot to dual-publish."
+          fi
+
+      # Flag corporate actions sitting in the price history as price moves.
+      # NSE's circuit limits make a -50% session impossible as an actual move,
+      # so anything past the threshold is a split, bonus or demerger -- and a
+      # momentum backtest reads it as a catastrophic loss that never happened.
+      # Non-blocking: the log is the deliverable, and a new find shows up as a
+      # warning on the run rather than stopping the sync.
+      - name: Check for corporate actions
+        # `|| true` alone also swallowed a CRASH, so a broken check looked
+        # exactly like a clean one. Exit 1 is also how --fail-on-new reports a
+        # new find (with its own warning); either way the run now says so.
+        run: python scripts/check_corporate_actions.py --fail-on-new || echo "::warning::Corporate-actions check exited non-zero (new find or failure) -- read the step log."
+
+      # Fold today's constituent list into the point-in-time membership
+      # timeline BEFORE committing, so the snapshot lands in the same commit as
+      # the CSVs it was taken from. Append-only and a no-op on an unchanged day,
+      # so this costs nothing until NSE actually reconstitutes the index.
+      - name: Record index membership
+        run: python scripts/build_membership_history.py || echo "::warning::Membership history was NOT recorded today -- read the step log."
+
+      - name: Commit and Push Updated Index & Classification Files
+        run: |
+          git config --global user.name 'github-actions[bot]'
+          git config --global user.email 'github-actions[bot]@users.noreply.github.com'
+          git add -A data/
+          if git diff --staged --quiet; then
+            echo "No data changes to commit."
+            exit 0
+          fi
+          git commit -m "chore(data): automated daily NSE index & classification sync [skip ci]"
+          # Rebase before pushing, and retry. A plain push loses the ENTIRE
+          # sync when anyone lands a commit on main during the two minutes this
+          # job runs -- which happened on 2026-08-18: the run computed the
+          # all-time-high snapshot, then died on "! [rejected] main -> main
+          # (fetch first)" and threw the whole thing away.
+          for attempt in 1 2 3 4 5; do
+            if git push; then
+              echo "Pushed on attempt $attempt."
+              exit 0
+            fi
+            echo "Push rejected on attempt $attempt; rebasing onto origin/main."
+            git fetch origin main
+            git rebase origin/main || {
+              echo "Rebase hit a conflict in generated data; keeping this run's copy."
+              # In a REBASE the sides are swapped: --ours is origin/main and
+              # --theirs is the commit being replayed, i.e. this run's data.
+              # --ours here silently dropped the whole sync commit, and the
+              # next push then "succeeded" with nothing in it.
+              git checkout --theirs -- data/ 2>/dev/null || true
+              git add -A data/
+              GIT_EDITOR=true git rebase --continue || git rebase --abort
+            }
+            sleep $((attempt * 3))
+          done
+          echo "::error::Could not push the data sync after 5 attempts."
+          exit 1
+

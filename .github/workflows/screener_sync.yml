@@ -1,0 +1,234 @@
+name: Screener daily price sync (overnight)
+
+# A SECOND price history, built in parallel with the Yahoo one and not yet
+# consumed by anything. It has to accumulate before it can be useful: screener
+# serves daily bars for about a year and weekly beyond that, so depth comes one
+# night at a time and every night missed is a day of daily history that cannot
+# be bought back later. That is why this runs now rather than after the engine
+# is wired to it.
+
+on:
+  schedule:
+    # 18:45 UTC = 00:15 IST nominally, every day. India's session has long
+    # settled and the site is at its quietest.
+    #
+    # GitHub's queue adds hours here, not minutes -- this slot fired at 21:15
+    # UTC on its first scheduled run, 2h30m late. It does not matter: the job
+    # re-requests a rolling year of settled closes and drops any session still
+    # trading, so a late run collects exactly the same data as a punctual one.
+    # What would matter is not running at all, which is why it runs daily.
+    #
+    # Every day, not weekdays: the job re-requests a rolling year on each run,
+    # so a weekend pass costs one cheap walk and repairs anything a blocked or
+    # truncated weeknight left behind.
+    - cron: '45 18 * * *'
+  workflow_dispatch:
+    inputs:
+      deep_check:
+        description: "Compare the whole stored history with Screener's 10-year weekly series tonight (normally every 7 days)"
+        type: boolean
+        default: false
+
+# NOT in the daily-sync group. This job must never delay or be delayed by the
+# pipeline production actually ranks off -- it writes a different file, touches
+# no Yahoo artifact, and a screener outage has to be incapable of failing the
+# run that feeds the live screener.
+concurrency:
+  group: screener-sync
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  screener:
+    runs-on: ubuntu-latest
+    # ~22 minutes measured for 750 symbols; with the extra universe (~420,
+    # fetched after the 750) and the random jitter, ~40 minutes a night, and
+    # ~50 on the first night the extras need their full history. The ceiling is
+    # generous because a paced walk must never be killed halfway by a timeout:
+    # the store would still be written, but the run would be marked failed and
+    # the reason would be invisible.
+    timeout-minutes: 90
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version-file: .python-version
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      # Its own cache namespace. Sharing the Yahoo one would let either job
+      # restore the other's frame, and the two must never meet: they do not
+      # share an adjustment basis. See SCREENER_PRICES_FILE.
+      - name: Restore screener store
+        id: restore-screener
+        uses: actions/cache/restore@v6
+        with:
+          path: data_cache/
+          key: screener-data-${{ runner.os }}-${{ github.run_id }}
+          restore-keys: |
+            screener-data-${{ runner.os }}-
+
+      # The cache is this job's working copy; the release asset is what was
+      # published. On 2026-09-21 the 10-year download reached the release but
+      # not the cache, and the next night's run started from the cache and
+      # published over it -- the store fell from 1161 dates to 718. Fold the
+      # published copy in first (gaps only, per-symbol basis check), so a
+      # publication is never lost to a stale or expired cache.
+      - name: Fold the published store into the working copy
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PYTHONPATH: .
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/screener-release
+          if gh release download data-latest --repo "$GITHUB_REPOSITORY" \
+               --pattern "screener_prices.parquet" --dir /tmp/screener-release --clobber; then
+            python scripts/screener_backfill.py \
+              --store data_cache/screener_prices.parquet \
+              --source-file /tmp/screener-release/screener_prices.parquet --apply
+          else
+            echo "::warning::No published Screener store to fold in; continuing from the cache."
+          fi
+
+      - name: Run screener sync
+        env:
+          PYTHONPATH: .
+          SCREENER_DEEP_CHECK: ${{ inputs.deep_check && '1' || '' }}
+        run: python scripts/sync_screener.py
+
+      # Screener restates a split/bonus/demerger some days after the event --
+      # the lag is not fixed. Until it does, the event is a step in this
+      # series; logging it lets adjust_ohlc neutralise it before ranking, and
+      # the adjustment switches itself off once the restated history arrives.
+      # Non-blocking, like the Yahoo check in daily_sync.yml.
+      - name: Check the Screener store for corporate actions
+        env:
+          PYTHONPATH: .
+        run: python scripts/check_corporate_actions.py --source screener --fail-on-new || echo "::warning::Screener corporate-actions check exited non-zero (new find or failure) -- read the step log."
+
+      # Rotating key, for the same reason the price cache uses one: actions/cache
+      # treats an entry as immutable and silently skips the save when the key
+      # already exists, which froze the Yahoo cache on the day it was first
+      # written.
+      - name: Save screener store
+        if: always()
+        uses: actions/cache/save@v6
+        with:
+          path: data_cache/
+          key: screener-data-${{ runner.os }}-${{ github.run_id }}
+
+      - name: Publish screener history
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          STORE="data_cache/screener_prices.parquet"
+          if [ ! -f "$STORE" ]; then
+            echo "::warning::No screener store was produced; nothing to publish."
+            exit 0
+          fi
+          ls -lh "$STORE"
+          # Never replace the published store with a smaller one (owner, 2026-10-07):
+          # a run that fell back to an old cache would otherwise lose history.
+          mkdir -p /tmp/published
+          if gh release download data-latest --repo "$GITHUB_REPOSITORY" --dir /tmp/published \
+               --pattern screener_prices.parquet 2>/dev/null; then
+            python -c "import sys, pyarrow.parquet as pq; n, o = (pq.ParquetFile(p).metadata.num_rows for p in sys.argv[1:3]); print(f'rows: new {n:,}, published {o:,}'); sys.exit(0 if n >= o else 1)" \
+              "$STORE" /tmp/published/screener_prices.parquet \
+              || { echo "::error::the new Screener store has fewer rows than the published one; not published"; exit 1; }
+          fi
+          gh release view data-latest --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 || \
+            gh release create data-latest \
+              --repo "$GITHUB_REPOSITORY" \
+              --title "Latest data snapshots" \
+              --notes "Rolling history published by the sync jobs." \
+              --latest=false
+          gh release upload data-latest "$STORE" --repo "$GITHUB_REPOSITORY" --clobber
+          echo "Uploaded screener_prices.parquet."
+
+      # Dual-publish the exact store that just went to the rolling GitHub
+      # Release. This keeps Screener as a distinct source dataset; it is never
+      # merged with Yahoo values.
+      - name: Publish validated Screener dataset to R2
+        env:
+          R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          R2_ENDPOINT: ${{ secrets.R2_ENDPOINT }}
+          R2_BUCKET: ${{ secrets.R2_BUCKET }}
+          PYTHONPATH: .
+        run: |
+          set -euo pipefail
+          STORE="data_cache/screener_prices.parquet"
+          if [ ! -f "$STORE" ]; then
+            echo "::error::Screener release artifact is missing; refusing to mark R2 dual publication complete."
+            exit 1
+          fi
+          python scripts/r2_publish.py \
+            --path "$STORE" \
+            --dataset prices/screener \
+            --source screener \
+            --key-root archive/prices/screener \
+            --pipeline-version "r2-screener-${GITHUB_SHA}" \
+            --release-tag data-latest
+
+      # The id map, the corporate-actions log and the pending-history list are
+      # the only things that belong in the repo: small and stable. The log is
+      # what the app and the ranking read to neutralise an event Screener has
+      # not restated yet; the pending list is what the app names on every page.
+      - name: Commit the company id map and corporate-actions log
+        if: always()
+        run: |
+          git config --global user.name 'github-actions[bot]'
+          git config --global user.email 'github-actions[bot]@users.noreply.github.com'
+          git add -A data/screener_company_ids.json data/corporate_actions_log.json
+          # Absent on a night that stopped before writing it; git add of a missing path is fatal.
+          if [ -f data/screener_pending_history.json ]; then git add data/screener_pending_history.json; fi
+          if git diff --staged --quiet; then
+            echo "No new company ids or corporate actions."
+            exit 0
+          fi
+          git commit -m "chore(data): screener company id map and corporate actions [skip ci]"
+          for attempt in 1 2 3 4 5; do
+            if git push; then
+              echo "Pushed on attempt $attempt."
+              exit 0
+            fi
+            echo "Push rejected on attempt $attempt; rebasing onto origin/main."
+            git fetch origin main
+            git rebase origin/main || {
+              # In a REBASE the sides are swapped: --ours is origin/main and
+              # --theirs is the commit being replayed, i.e. this run's data.
+              # --ours here silently dropped the whole sync commit, and the
+              # next push then "succeeded" with nothing in it.
+              git checkout --theirs -- data/ 2>/dev/null || true
+              git add -A data/
+              GIT_EDITOR=true git rebase --continue || git rebase --abort
+            }
+            sleep $((attempt * 3))
+          done
+          echo "::error::Could not push the company id map after 5 attempts."
+          exit 1
+
+      # Last, after everyone else's prices are published: a new index member
+      # Screener has no history for yet fails the run, so the failure alert
+      # still fires, without holding back the night for every other stock.
+      - name: Fail while index members have no Screener history
+        run: |
+          python - <<'PY'
+          import json, sys
+          pending = json.load(open("data/screener_pending_history.json")).get("symbols", {})
+          if pending:
+              names = ", ".join(f"{s} (since {d})" for s, d in pending.items())
+              print(f"::error::No Screener price history yet for: {names}. Every other stock was published.")
+              sys.exit(1)
+          print("Every current index member has Screener history.")
+          PY

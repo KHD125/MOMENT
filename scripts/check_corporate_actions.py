@@ -1,0 +1,215 @@
+#!/usr/bin/env python3
+"""Guard: flag corporate actions sitting in the price history as price moves.
+
+A stock split, bonus issue or demerger can appear in an adjusted price series as
+a single session of -50% or -79%. NSE's circuit limits make a move that size
+impossible as an actual price move, so anything past the threshold is an action,
+not a return -- and a momentum backtest reading it as a return records a
+catastrophic loss that never happened.
+
+Findings are appended to data/corporate_actions_log.json, which is append-only:
+once a session is flagged it stays on the record with the date it was first
+seen. That log is also the beginning of the corporate-actions history a proper
+raw-price store would need.
+
+    python scripts/check_corporate_actions.py            # report and log
+    python scripts/check_corporate_actions.py --dry-run
+    python scripts/check_corporate_actions.py --fail-on-new   # exit 1 on a new find
+
+It scans the Screener store (the ranking's own prices; no Yahoo since
+2026-10-02). Screener re-adjusts its
+history after an event, but only some days later -- the lag is not fixed. Until
+then the event is a step in that series too, and it is logged here so
+adjust_ohlc neutralises it before ranking; once Screener restates, the step is
+gone and the adjustment switches itself off. Only the daily part is scanned:
+the older history is weekly, and five sessions can legitimately move 35%.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import sys
+from datetime import date
+from pathlib import Path
+
+import pandas as pd
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from src.engine.corporate_actions import IMPLAUSIBLE_MOVE, detect, summarise  # noqa: E402
+
+LOG_PATH = Path("data/corporate_actions_log.json")
+
+
+def _load(path: Path) -> dict:
+    if not path.exists():
+        return {"schema_version": 1, "threshold": IMPLAUSIBLE_MOVE, "events": {}}
+    with path.open(encoding="utf-8") as fh:
+        log = json.load(fh)
+    if "events" not in log:
+        raise ValueError(f"{path} is not a corporate-actions log")
+    return log
+
+
+def daily_start(index: pd.Index) -> pd.Timestamp | None:
+    """First date of the unbroken daily tail (no gap over 5 days), or None."""
+    dates = pd.DatetimeIndex(index).normalize().unique().sort_values()
+    if len(dates) < 2:
+        return None
+    gaps = pd.Series(dates[1:] - dates[:-1]).dt.days.to_numpy()
+    start = len(dates) - 1
+    while start > 0 and gaps[start - 1] <= 5:
+        start -= 1
+    return dates[start]
+
+
+def _closes(source: str) -> tuple[pd.DataFrame, pd.Timestamp | None]:
+    """(closes to scan, first date to scan from) for one source."""
+    if source == "screener":
+        from src.core.config import SCREENER_PRICES_FILE
+        from src.loaders import screener_loader
+
+        store = screener_loader.load_store(SCREENER_PRICES_FILE)
+        closes = screener_loader.closes(store)
+        return closes, daily_start(closes.index) if not closes.empty else None
+    return pd.DataFrame(), None
+
+
+def confirm_restated(events: dict, closes: pd.DataFrame, since: pd.Timestamp | None,
+                     fo_symbols: set[str] | None = None) -> list[str]:
+    """Mark F&O moves as corporate actions once Screener has restated them.
+
+    An F&O move that matches no split/bonus ratio is treated as real until
+    confirmed (corporate_actions.needs_confirmation). Screener restates a
+    demerger's history within days and never restates a crash, so a step that
+    is no longer in the Screener series is the confirmation. Only the DAILY
+    part counts: across weekly points a crash and its rebound (YESBANK, March
+    2020) would look like no step at all. Returns the keys confirmed.
+    """
+    from src.engine.corporate_actions import (
+        CORPORATE_ACTION,
+        _step_is_still_present,
+        load_fo_symbols,
+        needs_confirmation,
+    )
+
+    fo = load_fo_symbols() if fo_symbols is None else fo_symbols
+    confirmed = []
+    for key, event in events.items():
+        if event.get("verdict") or not needs_confirmation(event, fo):
+            continue
+        symbol = event.get("symbol")
+        if since is None or symbol not in closes.columns:
+            continue
+        when = pd.Timestamp(event["date"])
+        series = closes[symbol].dropna()
+        if when <= since or series.loc[series.index < when].empty \
+                or series.loc[series.index >= when].empty:
+            continue
+        if _step_is_still_present(series, when, float(event["ratio"])):
+            continue
+        event["verdict"] = CORPORATE_ACTION
+        event["verdict_note"] = (f"Screener restated the history (checked "
+                                 f"{date.today().isoformat()}): a corporate action.")
+        confirmed.append(key)
+    return confirmed
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument("--log", default=str(LOG_PATH))
+    ap.add_argument("--threshold", type=float, default=IMPLAUSIBLE_MOVE)
+    ap.add_argument("--dry-run", action="store_true")
+    ap.add_argument(
+        "--fail-on-new",
+        action="store_true",
+        help="Exit non-zero when a session is flagged for the first time, so a "
+        "scheduled run surfaces it instead of burying it in a log.",
+    )
+    ap.add_argument("--source", choices=("screener",), default="screener",
+                    help="which price history to scan (only the Screener store since 2026-10-02)")
+    args = ap.parse_args()
+
+    adj, since = _closes(args.source)
+    if adj.empty:
+        print(f"✗ no {args.source} closes to check")
+        return 1
+
+    found = detect(adj, threshold=args.threshold, since=since)
+    info = summarise(found)
+    scanned = adj.loc[adj.index >= since] if since is not None else adj
+    print(
+        f"→ scanned {args.source}: {scanned.shape[0]} sessions x {adj.shape[1]} symbols "
+        f"at +/-{args.threshold:.0%}"
+    )
+
+    log = _load(Path(args.log))
+    events = dict(log.get("events", {}))
+    confirmed = confirm_restated(events, adj, since) if args.source == "screener" else []
+    for key in confirmed:
+        print(f"  CONFIRMED {key}: Screener restated the history -- a corporate action")
+    if found.empty and not confirmed:
+        print("✓ no implausible sessions")
+        return 0
+    new_keys: list[str] = []
+
+    for _, row in found.iterrows():
+        key = f"{row['Date']:%Y-%m-%d}:{row['Symbol']}"
+        if key in events:
+            continue
+        new_keys.append(key)
+        events[key] = {
+            "date": f"{row['Date']:%Y-%m-%d}",
+            "symbol": row["Symbol"],
+            "move": round(float(row["Move %"]), 6),
+            "ratio": round(float(row["Ratio"]), 6),
+            "prev_close": round(float(row["Prev Close"]), 4),
+            "close": round(float(row["Close"]), 4),
+            "looks_like": row["Looks Like"],
+            "kind": row["Kind"],
+            "first_seen": date.today().isoformat(),
+            "source": args.source,
+        }
+
+    print(
+        f"  {info['total']} flagged ({info['split_like']} split/bonus-like, "
+        f"{info['unclassified']} unclassified), {len(new_keys)} new"
+    )
+    for _, row in found.iterrows():
+        mark = "NEW " if f"{row['Date']:%Y-%m-%d}:{row['Symbol']}" in new_keys else "    "
+        print(
+            f"  {mark}{row['Date']:%Y-%m-%d}  {row['Symbol']:<12} "
+            f"{row['Move %']:+7.1%}  ratio {row['Ratio']:.4f}  {row['Looks Like']}"
+        )
+
+    if info["unclassified"]:
+        print(
+            "\n  Unclassified sessions match no standard split ratio. The usual "
+            "cause is a demerger or spin-off, which yfinance does NOT adjust "
+            "for: the parent's price legitimately falls, but shareholders "
+            "received stock in the new entity, so no economic loss occurred. "
+            "The backtest still reads it as a loss."
+        )
+
+    log["events"] = dict(sorted(events.items()))
+    log["threshold"] = args.threshold
+    log["last_checked"] = date.today().isoformat()
+
+    if args.dry_run:
+        print("→ dry run; log not written")
+    else:
+        Path(args.log).parent.mkdir(parents=True, exist_ok=True)
+        with Path(args.log).open("w", encoding="utf-8") as fh:
+            json.dump(log, fh, indent=2)
+            fh.write("\n")
+        print(f"✓ wrote {args.log} ({len(events)} events on record)")
+
+    if new_keys and args.fail_on_new:
+        print(f"::warning::{len(new_keys)} newly flagged session(s)")
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
